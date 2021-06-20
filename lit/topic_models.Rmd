@@ -1,0 +1,313 @@
+---
+title: "Running Topic Models"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidytext)
+library(stm)
+library(furrr)
+# read in corpus
+corpus <- read_rds(here::here("corpus.rds"))
+```
+
+```{r}
+corpus_dfm <- corpus %>%
+  count(bill_title, word, sort = TRUE) %>%
+  cast_dfm(bill_title, word, n)
+
+# initialize multiple cores
+# plan(multiprocess)
+# mods_multiple_k <- data_frame(
+#    K = c(20, 40, 50, 60, 70, 80, 100)
+#    ) %>%
+#   mutate(topic_model = furrr::future_map(
+#      K, ~stm(corpus_sparse, K = .,verbose = FALSE))
+#      )
+
+k_20 <- stm(corpus_dfm, init.type = "Spectral", K = 0 , verbose = TRUE)
+write_rds(k_20, "k121_corpus_dfm.rds")
+k_20 <- read_rds("k121_corpus_dfm.rds")
+
+k_200 <- stm(corpus_dfm, K = 300, verbose = TRUE)
+topics <- k_200 %>% summary() 
+tidy_k_200 <- k_200 %>%  tidy()
+write_rds(tidy_k_200, "k200_corpus_dfm.rds")
+tidy_k_200 <- read_rds("k200_corpus_dfm.rds")
+
+# tidy_k_200 %>% 
+#    group_by(topic) %>%
+#     top_n(5, beta) %>%
+#     ungroup() %>%
+#    arrange(desc(topic)) %>% 
+#    View()
+
+filter_terms <- c(
+   # laws
+   "uwg", "kvg", "rtvv", "rtvg", "bpr",
+   "asylg", "kkjpd", "kkljv", "vefidleg",
+   "fidleg", "lfg",  "nbps", "böb", "ve",
+   "dbg", "sthg", "öbu", "kg", "vöv", "uid",
+   "uidg", "kfv", "vffw", "köv", "vap", "zgb",
+   "or", "stgb", "bv", "lvgrevision", "vestgb",
+   "gwg", "nissg", "finfrag", "urk", "vap",
+   "entsg",  "bgsa", "fzg", "safig", "bzg", 
+   "gtg", "medbg", "bankg", "kvg", "zg", "bgs",
+   "stvg", "stahig", "webig", "publg", "wag", "vlg", 
+   "rpg", "kgsg", "gesbg", "mg", "thg", "epdg", "zertes",
+   "ibsg", "eng", "büpf",
+   # parties
+  "ldp",
+  # organizations
+  "unhcr", "bvger", "srg", "uri", "sro", "ubs",
+  "cs", "vlp", "pro", "natura", "gdeprässg",
+  "sihk", "fodk", "alpar", "micarna", "pharmacie",
+  "pharmacies", "ccczh", "chf", "swiss", "caritas",
+  "bern", "zürich", "arbus", "txg", "aresa", "euo",
+  "hausverein", "agridea", "zmp", "vogelwarte", "centre",
+  "patronal", "bundesrat", "grüne", "sfh", "ekm", "sah",
+  "icjch", "erdölvereinigung", "energiestiftung",
+  "svr", "fhnw", "sll", "bls",  "veb.ch", "unibs",
+  "regierungsrat", "homburger", "hesso", "swissuniversities",
+  "svbb", "ärzte", "eurex", "six", "helvetia", "pro", 
+  "lumneziana", "ksbs", "pilatus", "esf", "compenswiss",
+  "zri", "kt", "swico", "svoam", "ekbb",
+  # procedure
+  "bund", "öffentlich", "formulierungsvorschlag",
+  "subvariante", "vernehmlassungsteilnehmer",
+  "vernehmlassung*", "[Tt]eilnehmer",
+  "massnahmen", "sammelschrift",
+  "entwurf", "öffentlichen",
+  "variant*", "canton", "cantone", "stato",
+  "elettorale", "vorlage", "postfach",
+  "wirtschaft", "dachverbände", "berggebiete", "städte", "partei*",
+  "coo", "chancellerie", "listes",
+  "inhaltsverzeichnis", "änderung",
+  "eftaübereinkommen", "massnahm*", "anhang", "cercle",
+  "streichung", "eingereicht*", "konferenz", "anhörung",
+  "vorschlag", "organisation*", "änderung", "bereich",
+  "internationales", "vorschriften", "möglichkeit", "jahre",
+  "entscheid*", "anpassung", "gemeinde*", "allgemein*",
+  "referenzaktenzeichen", "vorentwurf",
+  "vereinigung", "revisione", "pid", "associazione", 
+  "associazion", "postfach", "vorschriften", "vl",
+  # stopwords
+  "u\\.a\\.", "beim", "mehr", "weitere", "einzelne", "bereits",
+  "wurden", "tel", "enthaltung", "k\\.a\\.", "herr", "n\\.v",
+  "eidg", "öff",
+  # policies
+  "arzneimittel*", "sporttoto", "röhre", "feuerwehrsold",
+  # places
+  "ragaz",
+  # reported speech
+  "hält", "schlägt", "weist", "wurde", "verlangt", "verzichtet",
+  "zustimmung", "wovon", "schlagen", "beantrag"#,
+  )
+
+# more aggressive subsetting
+corpus_dfm_filtered <- corpus_dfm %>% 
+   quanteda::dfm_select(pattern = filter_terms, selection = "remove", valuetype = "regex") %>%
+   quanteda::dfm_wordstem(language = "de")
+
+k_search <- stm(corpus_dfm_filtered, init.type = "Spectral", K = 0 , verbose = TRUE)
+tidy_k_search <- k_search %>% tidy()
+k_search<- read_rds("k121_corpus_dfm.rds")
+
+
+# try POS-tagging
+# library(udpipe)
+# german_mod_dl <- udpipe::udpipe_download_model("german-gsd")
+# ud_german <- udpipe_load_model(german_mod_dl$file_model)
+
+corpus_dfm_filtered_tidy <- corpus_dfm %>%
+   tidy()
+pos <- udpipe_annotate(ud_german, corpus_dfm_filtered_tidy$term)
+write_rds(pos, "part_of_speech.rds")
+pos <- read_rds("part_of_speech.rds") %>% as_tibble()
+# pos %>% as_tibble()
+corpus_dfm_filtered_tidy_pos <- corpus_dfm_filtered_tidy %>%
+   mutate(part_of_speech = pos$upos)
+
+# pos$upos %>% as_tibble()
+
+# corpus_dfm_filtered <- corpus_dfm %>% quanteda::dfm_remove(filter_terms, valuetype = "glob")
+# k_search <- stm(corpus_dfm_filtered, init.type = "Spectral", K = 0 , verbose = TRUE)
+
+# 189: status quo bias
+# 122: insecurity, economy 
+# 103: steuerhinterziehung
+```
+
+```{r}
+library(stm)
+library(furrr)
+plan(multiprocess(workers = availableCores() - 2))
+
+many_models_1 <- tibble(
+   K = c(20, 40, 50)
+   ) %>%
+  mutate(
+     topic_model = furrr::future_map(K, ~stm(corpus_dfm_filtered, K = .x, verbose = TRUE)))
+write_rds(many_models_1, "many_models_1.rds")
+
+library(furrr)
+plan(multiprocess(workers = availableCores() - 2))
+many_models_2 <- tibble(
+   K = c(60, 70, 80)
+   ) %>%
+  mutate(
+     topic_model = furrr::future_map(K, ~stm(corpus_dfm_filtered, K = .x, verbose = TRUE)))
+write_rds(many_models_2, "many_models_2.rds")
+
+library(furrr)
+plan(multiprocess(workers = availableCores() - 2))
+many_models_3 <- tibble(
+   K = c(100, 120, 140)
+   ) %>%
+  mutate(
+     topic_model = furrr::future_map(K, ~stm(corpus_dfm_filtered, K = .x, verbose = TRUE)))
+write_rds(many_models_3, "many_models_3.rds")
+
+library(furrr)
+plan(multiprocess(workers = availableCores() - 2))
+many_models_4 <- tibble(
+   K = c(140, 160, 180)
+   ) %>%
+  mutate(
+     topic_model = furrr::future_map(K, ~stm(corpus_dfm_filtered, K = .x, verbose = TRUE)))
+write_rds(many_models_4, "many_models_4.rds")
+
+library(furrr)
+plan(multiprocess(workers = availableCores() - 2))
+many_models_5 <- tibble(
+   K = c(200, 220, 240)
+   ) %>%
+  mutate(
+     topic_model = furrr::future_map(K, ~stm(corpus_dfm_filtered, K = .x, verbose = TRUE)))
+write_rds(many_models_5, "many_models_5.rds")
+
+library(furrr)
+plan(multiprocess(workers = availableCores() - 2))
+many_models_6 <- tibble(
+   K = c(260, 280, 300)
+   ) %>%
+  mutate(
+     topic_model = furrr::future_map(K, ~stm(corpus_dfm_filtered, K = .x, verbose = TRUE)))
+write_rds(many_models_6, "many_models_6.rds")
+
+write_rds(
+   corpus_dfm_filtered, 
+   "corpus_dfm_filtered.rds"
+   )
+```
+
+
+```{r}
+# retrieve saved models
+read_many_models_1 <- read_rds("many_models_1.rds")
+read_many_models_2 <- read_rds("many_models_2.rds")
+read_many_models_3 <- read_rds("many_models_3.rds")
+read_many_models_4 <- read_rds("many_models_4.rds")
+read_many_models_5 <- read_rds("many_models_5.rds")
+read_many_models_6 <- read_rds("many_models_6.rds")
+
+all_models <- data_frame(
+   topic_model = list(
+      read_many_models_1$topic_model[[1]],
+read_many_models_1$topic_model[[2]],
+read_many_models_1$topic_model[[3]],
+read_many_models_2$topic_model[[1]],
+read_many_models_2$topic_model[[2]],
+read_many_models_2$topic_model[[3]],
+read_many_models_3$topic_model[[1]],
+read_many_models_3$topic_model[[2]],
+read_many_models_3$topic_model[[3]],
+read_many_models_4$topic_model[[1]],
+read_many_models_4$topic_model[[2]],
+read_many_models_4$topic_model[[3]],
+read_many_models_5$topic_model[[1]],
+read_many_models_5$topic_model[[2]],
+read_many_models_5$topic_model[[3]],
+read_many_models_6$topic_model[[1]],
+read_many_models_6$topic_model[[2]],
+read_many_models_6$topic_model[[3]]
+      ),
+   K = c(
+      20, 40, 50, 
+      60, 70, 80, 
+      100, 120, 140,
+      140, 160, 180,
+      200, 220, 240, 
+      260, 280, 300
+      )
+)
+
+```
+
+
+```{r}
+corpus_dfm_filtered_used <- read_rds("corpus_dfm_filtered.rds")
+corpus_dfm_filtered_used_sparse <- corpus_dfm_filtered_used %>%
+   tidy() %>%
+   cast_sparse(document, term, count)
+
+heldout <- make.heldout(corpus_dfm_filtered_used_sparse)
+
+library(furrr)
+plan(multiprocess(workers = availableCores() - 2))
+k_result <- all_models %>%
+  mutate(exclusivity = furrr::future_map(topic_model, exclusivity),
+         semantic_coherence = furrr::future_map(topic_model, semanticCoherence, corpus_dfm_filtered_used_sparse),
+         eval_heldout = furrr::future_map(topic_model, eval.heldout, heldout$missing),
+         residual = furrr::future_map(topic_model, checkResiduals, corpus_dfm_filtered_used_sparse),
+         bound =  furrr::future_map_dbl(topic_model, function(x) max(x$convergence$bound)),
+         lfact = furrr::future_map_dbl(topic_model, function(x) lfactorial(x$settings$dim$K)),
+         lbound = bound + lfact,
+         iterations = furrr::future_map_dbl(topic_model, function(x) length(x$convergence$bound)))
+
+write_rds(k_result, "k_result.rds")
+```
+
+```{r}
+k_result <- read_rds("k_result.rds")
+
+k_result %>%
+  transmute(K,
+            `Lower bound` = lbound,
+            Residuals = map_dbl(residual, "dispersion"),
+            `Semantic coherence` = map_dbl(semantic_coherence, mean),
+            `Held-out likelihood` = map_dbl(eval_heldout, "expected.heldout")) %>%
+  gather(Metric, Value, -K) %>%
+  ggplot(aes(K, Value, color = Metric)) +
+  geom_line(size = 1.5, alpha = 0.7, show.legend = FALSE) +
+  facet_wrap(~Metric, scales = "free_y") +
+  labs(x = "K (number of topics)",
+       y = NULL,
+       title = "Model diagnostics by number of topics"
+       # subtitle = "These diagnostics indicate that a good number of topics would be around 60")
+) +
+   ggthemes::theme_hc()
+```
+
+
+```{r}
+k_result %>%
+  select(K, exclusivity, semantic_coherence) %>%
+  # filter(K %in% c(20, 40, 50)) %>%
+  unnest() %>%
+  mutate(K = as.factor(K)) %>%
+  ggplot(aes(semantic_coherence, exclusivity, color = K)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(x = "Semantic coherence",
+       y = "Exclusivity",
+       title = "Comparing exclusivity and semantic coherence"
+       # subtitle = "Models with fewer topics have higher semantic coherence for more topics, but lower exclusivity") + 
+  ) +
+   ggthemes::theme_hc()
+
+```
+

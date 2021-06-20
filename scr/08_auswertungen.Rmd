@@ -1,0 +1,2694 @@
+---
+title: "Beleidigungen in YouTube-Kommentaren zu Weltwoche Daily - Explorative Datenanalyse"
+author: "Balthasar Sager"
+date: "`r Sys.Date()`"
+output:
+  bookdown::html_document2: 
+    theme: cosmo
+    number_sections: yes
+    fig_caption: yes
+    highlight: kate
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = FALSE)
+```
+
+Was ist 'offensive' Language, die der Classifier (**Coarse-grained Binary Classification)** erkennt?
+
+> The OFFENSE category covered abusive language, insults, as well as merely profane statements.
+
+Vom Algorithmus als OFFENSE eingestufte Kommentare charakterisiere ich im Artikel als 'toxisch'.
+
+Einlesen der aufbereiteten Daten und zusammenführen:
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggtext)
+library(kableExtra)
+library(tidytext)
+source(here::here("scr", "helpers.R"))
+theme_set(theme_minimal())
+
+meta_alle_videos <- data.table::fread(here::here("data", "meta.csv")) %>%
+  tibble::as_tibble() %>%
+  mutate(date = as.Date(content_details_video_published_at))
+
+ids_sendungen_nach_stichtag <- meta_alle_videos %>%
+  filter(content_details_video_published_at > lubridate::ymd("2020-01-01")) %>%
+  distinct(content_details_video_id) %>% 
+  pull(content_details_video_id)
+
+meta <- meta_alle_videos %>%
+    filter(content_details_video_id %in% ids_sendungen_nach_stichtag) 
+
+kommentare <- data.table::fread(here::here("data", "kommentare.csv")) %>%
+  filter(video_id %in% ids_sendungen_nach_stichtag) %>%
+  tibble::as_tibble() %>%
+  select(-c(
+    kind, etag, response_kind, items_kind,
+    items_etag, response_etag
+  ))
+
+kommentare_scores <- data.table::fread(here::here("data", "klassifiziert.csv")) %>%
+  tibble::as_tibble() %>%
+  rename(kommentar_id = id)
+
+kommentare_scores_und_meta <- left_join(
+  meta, kommentare_scores,
+  by = c("content_details_video_id" = "video_id")
+) %>%
+  left_join(kommentare, by = c(
+    "kommentar_id" = "id",
+    "content_details_video_id" = "video_id"
+  )) %>%
+  # sample-kommentar rausnehmen
+  filter(kommentar_id != "12345")
+
+kommentare_mit_scores <- kommentare %>% 
+  left_join(kommentare_scores, by = c("id" = "kommentar_id"))
+
+stm_models <- readr::read_rds(here::here("data", "stm_models.rds"))
+untertitel_sparse <- readr::read_rds(here::here("raw", "untertitel_sparse.rds"))
+stm_models_kommentare <- readr::read_rds(here::here("data", "stm_models_kommentare.rds"))
+kommentare_sparse <- readr::read_rds(here::here("raw", "kommentare_sparse.rds"))
+untertitel_long <- data.table::fread(here::here("data", "untertitel.csv")) %>%
+  left_join(meta, by = c("vid" = "content_details_video_id")) %>%
+  filter(vid %in% ids_sendungen_nach_stichtag) %>%
+  tibble::as_tibble() %>%
+  unnest_tokens(token = "words", text, output = "wort") %>% 
+  mutate(term_list = stringr::str_squish(wort)) 
+```
+
+# Datenkomplettheit
+
+Metadaten und Scores:
+
+```{r}
+kommentare_meta_und_scores <- left_join(
+  meta, kommentare_scores,
+  by = c("content_details_video_id" = "video_id")
+)
+kommentare_meta_und_scores %>% 
+  count(content_details_video_id,  na_score = is.na(score)) %>% 
+  filter(na_score == TRUE)
+```
+
+- Kommentare da, ausser für ein Video
+
+Wie viele Sendungen analysiere ich?
+```{r}
+meta %>%
+  distinct(content_details_video_id) %>% 
+  count()
+```
+
+Wie viele Kommentare _analysiert_?
+
+```{r}
+n_kommentare_analysiert <- kommentare_scores_und_meta %>%
+  filter(date > lubridate::ymd("2020-01-01")) %>%  
+  count() %>% 
+  pull()
+n_kommentare_analysiert
+```
+
+Wie viele Kommentare wären da?
+
+```{r}
+n_kommentare_auf_youtube <- meta %>%
+  filter(date > lubridate::ymd("2020-01-01")) %>%  
+  summarize(n_comments = sum(statistics_comment_count)) %>%
+  pull()
+n_kommentare_auf_youtube 
+```
+
+Anteil, den ich analysiere:
+
+```{r}
+n_kommentare_analysiert/n_kommentare_auf_youtube
+```
+
+<!-- Um welche Uhrzeit gehen die Videos raus? -->
+
+<!-- # https://rstudio-pubs-static.s3.amazonaws.com/280487_1ee1651f7cae4c8fa9f71f631bf38c11.html -->
+<!-- ```{r} -->
+<!-- meta %>% -->
+<!--   transmute(release_time = hms::hms(hms::as_hms(content_details_video_published_at))) -->
+
+<!-- meta %>%  -->
+<!--   transmute(release_time = format(content_details_video_published_at, "%H:%M:%S")) -->
+<!-- meta %>%  -->
+<!--   transmute(release_time = format(content_details_video_published_at, "%H:%M:%S")) -->
+<!-- ``` -->
+
+
+```{r}
+kommentare_scores_und_meta %>%
+  count() 
+```
+
+Wie viele Untertitel?
+```{r}
+untertitel_sparse@docvars %>%
+  as_tibble() %>% 
+  janitor::clean_names() %>% 
+  distinct(docid) %>% 
+  count()
+```
+
+
+# Metadaten
+
+## Publikationsfrequenz von Weltwoche Daily
+
+Lange nicht allzu 'daily' --- Anzahl Videos pro Kalenderwoche:
+
+```{r}
+meta_alle_videos %>%
+  group_by(year_week = lubridate::floor_date(content_details_video_published_at, "1 week")) %>%
+  summarize(count = n()) %>%
+  ggplot(aes(year_week, count)) +
+  geom_col()
+```
+
+-   noch nicht besonders 'daily' am Anfang
+
+```{r}
+# meta %>%
+#   group_by(year_week = lubridate::floor_date(content_details_video_published_at, "1 week")) %>%
+#   summarize(count = n()) %>%
+#   ungroup() %>% 
+#   group_by(year_month = lubridate::floor_date(year_week, "1 month")) %>% 
+#   summarize(mean_publication_frequency = mean(count, na.rm = TRUE)) 
+```
+
+### Likes & Dislikes
+
+```{r}
+meta %>%
+  mutate(like_ratio = statistics_like_count / (statistics_like_count + statistics_dislike_count)) %>%
+  ggplot(aes(like_ratio)) +
+  geom_histogram()
+```
+
+```{r}
+meta %>%
+  mutate(like_ratio = statistics_like_count / (statistics_like_count + statistics_dislike_count)) %>% 
+  summarize(mean_like_ratio = mean(like_ratio, na.rm = TRUE))
+```
+
+
+## Popularität von Weltwoche Daily
+
+Anzahl Views:
+
+```{r}
+meta %>%
+  ggplot() +
+  geom_line(aes(date, statistics_view_count)) +
+  scale_y_continuous(label = scales::label_number(big.mark = "'")) +
+  scale_x_date(date_breaks = "3 month", date_labels = "%B\n%Y")  +
+  labs(caption = "Y-Achse ist Log10-transformiert", x = "", y = "Views")
+```
+
+Summe der Videoaufrufe in Millionen:
+```{r}
+meta %>%
+  summarize(sum_view_count = sum(statistics_view_count, na.rm = TRUE)/1e6) 
+```
+
+Durschnittliche Views:
+```{r}
+meta %>%
+  summarize(mean_view_count = mean(statistics_view_count, na.rm = TRUE)) 
+```
+
+
+```{r}
+quantile_zu_berechnen <- seq.int(from = 0.1, to = 1, by = 0.1)
+meta %>%
+  summarize(sum_view_count = purrr::map_dbl(quantile_zu_berechnen, quantile, x = statistics_view_count)) %>% 
+  mutate(dezil = quantile_zu_berechnen * 100) %>%
+  kable()
+```
+
+# Kommentare
+
+## Kommentare generell
+
+```{r, fig.cap='YouTube-Kommentare pro Episode'}
+meta %>% 
+  ggplot(aes(date, statistics_comment_count)) +
+  geom_line() +
+  scale_y_continuous(label = scales::label_number(big.mark = "'")) +
+    scale_x_date(
+      date_labels = "%B\n%Y",
+    date_breaks = "3 month"
+    ) +
+  labs(y = "Kommentare", x = "")
+```
+
+-   gemäss Metadaten zu den Videos so viele, API lässt aber nicht *alle* einfach so herunterladen
+
+    -   analysiert werden etwas weniger, ohne Replies of Replies
+
+```{r, fig.cap="Anzahl Ansichten von Weltwoche Daily-Episoden auf YouTube"}
+meta %>%
+  ggplot(aes(date, statistics_view_count)) +
+  geom_line() +
+  scale_y_log10(label = scales::label_number(big.mark = "'")) +
+  scale_x_date(
+    date_labels = "%B\n%Y",
+    date_breaks = "3 month"
+  ) +
+  labs(caption = "Y-Achse Log10-transformiert")
+```
+
+-   wilde Fluktuationen mit Rolling Average glätten
+
+### Immer etwa dieselben Kommentierenden?
+
+Welchen Anteil aller Kommentare haben welche Kommentierenden geschrieben?
+```{r}
+kommentare_pro_user <- kommentare_scores_und_meta %>%
+  # für Beleidigungen hier noch `label` und `score` hinzufügen
+  select(
+    # hier `snippet_author_channel_id_value` nehmen, da `display_name` nicht stabil über Zeit
+    snippet_author_channel_id_value,
+    snippet_author_display_name, 
+    date, snippet_like_count, content_details_video_id
+    ) %>%
+  count(snippet_author_channel_id_value, sort = TRUE) %>% 
+  mutate(percent = (n/sum(n, na.rm = TRUE) * 100))
+kommentare_pro_user %>% 
+  arrange(desc(percent))
+```
+
+-   `r nrow(kommentare_pro_user)` verschiedene Kommentierende in den Daten verzeichnet
+
+Wer schreibt wie viele Kommentare?
+
+```{r}
+kommentare_pro_user %>%
+  ggplot(aes(n)) +
+  geom_histogram() +
+  # scale_y_log10() +
+  scale_y_sqrt(breaks = c(1, 8, 20, 50, 100, 500, 1000, 1500, 2000, 3000, 4000, 6000)) +
+  labs(
+    caption = "Y-Achse ist Log10-skaliert",
+    x = "Verfasste Kommentare",
+    y = "Anzahl Nutzer",
+    title = "Wie viele Nutzer schreiben wie viele Kommentare?"
+  )
+```
+
+-   viele schreiben nur einen Kommentar
+
+```{r}
+kommentare_pro_user %>% 
+  ggplot(aes(n)) +
+  geom_density() +
+  scale_x_log10()
+```
+
+```{r}
+quantile_zu_berechnen <- seq.int(from = 0.1, to = 1, by = 0.1)
+kommentare_pro_user %>%
+  summarize(sum_view_count = purrr::map_dbl(quantile_zu_berechnen, quantile, x = n)) %>%
+  mutate(dezil = quantile_zu_berechnen * 100) %>%
+  rmarkdown::paged_table()
+```
+
+- 80 Prozent der Kommentierenden meldeten sich acht Mal, 90 Prozent 19 Mal oder weniger zu Wort, die letzen 10 Prozent zwischen 19 und 737 Mal.
+
+Wie viele Kommentierende gab es denn?
+
+```{r}
+kommentare_pro_user %>% 
+  distinct(snippet_author_channel_id_value) %>%
+  count(snippet_author_channel_id_value)
+```
+
+
+## Klassifizierung gemäss Algorithmus
+
+### Modellgüte des Classifiers überprüfen
+
+#### Originaldatenset
+
+Hier überprüfe ich die Modellgüte des verwendeten Classifiers am Originaldatenset, da auf Hugging Face keine entsprechenden Details publiziert wurden.
+
+```{r}
+germ_eval_klassifiziert <- data.table::fread(
+  here::here("data", "germ_eval_klassifiziert.csv")
+) %>%
+  transmute(
+    tweet_no = id, 
+    vorhergesagter_wert = label
+  )
+germ_eval_test_set <- data.table::fread(
+  here::here("raw", "germ_eval_2018", "germeval2018.test.txt"),
+  col.names = c("tweet", "coarse", "fine"),
+  quote = ""
+) %>% 
+  mutate(tweet_no = row_number()) %>% 
+  transmute(echter_wert = coarse, tweet_no)
+zu_evaluieren <- left_join(germ_eval_test_set, germ_eval_klassifiziert, by = c("tweet_no"))
+
+werte_raw <- zu_evaluieren %>%
+  count(echter_wert, vorhergesagter_wert) %>%
+  mutate(
+    metrik =   c("True Positives", "False Negatives", "False Positive", "True Negatives"),
+    anteil = n/sum(n) * 100
+  )
+werte_raw
+```
+
+```{r}
+# werte_raw %>%
+#   select(-c(echter_wert, vorhergesagter_wert, n)) %>% 
+#   tidyr::pivot_wider(names_from = metrik, values_from = anteil) %>%
+#   janitor::clean_names() %>% 
+#   summarize(
+#     sensitivitaet = 
+#   )
+
+confusion_matrix_germeval <- caret::confusionMatrix(
+  reference = as.factor(zu_evaluieren$echter_wert),
+  data = as.factor(zu_evaluieren$vorhergesagter_wert),
+  positive = "OFFENSE"
+)
+# data frame daraus machen
+confusion_matrix_germeval_tbl <- confusion_matrix_germeval$byClass %>% 
+  tibble::enframe() 
+
+confusion_matrix_germeval_wide <- confusion_matrix_germeval_tbl %>%
+  tidyr::pivot_wider() %>% 
+  janitor::clean_names()
+
+confusion_matrix_germeval_tbl %>% 
+  rmarkdown::paged_table()
+```
+
+- Sensitivity/Recall/Hit Rate/True Positive Rate: `r confusion_matrix_germeval_wide$sensitivity * 100` % der toxischen Kommentare werden korrekt als solche eingestuft
+- Specificity/Selectivity/True Negative Rate: `r confusion_matrix_germeval_wide$specificity * 100` % der nicht-toxischen Kommentare werden korrekt als nicht-toxisch eingestuft
+- Precision: `r confusion_matrix_germeval_wide$precision * 100` % aller als toxisch klassifizierten Kommentare wurden korrekt als solche klassifiziert (??)
+
+
+
+#### YouTube-Kommentare
+
+Sample von 250 Kommentare mit 125 pro mutmasslicher Klassifizierung, die manuell zu annotieren sind:
+
+```{r}
+# kommentare_scores_und_meta %>%
+#   group_by(label) %>% 
+#   slice_sample(n = 125) %>%
+#   ungroup() %>% 
+#   arrange(desc(id)) %>% 
+#   transmute(snippet_text_display, id) %>% 
+#   readr::write_csv(
+#     here::here("raw", "classifier", "zu_annotieren.csv")
+#   )
+```
+
+Confusion Matrix:
+
+```{r}
+annotiert <- readr::read_csv(
+    here::here("raw", "classifier", "annotiert.csv")
+  ) %>%
+  transmute(snippet_text_display, echter_wert = annotiert) %>% 
+  left_join(kommentare_scores_und_meta, by =  c("snippet_text_display")) %>%
+  distinct(snippet_text_display, echter_wert, vorhergesagter_wert = label, score)
+```
+
+- Precision: 
+  - True Positives / (True Positives + False Positives)
+
+
+- Relativ viele False Positives (Kommentare, die den Wert OTHER hätten, aber als OFFENSE eingestuft wurden) (knapp ein Viertel)
+
+```{r}
+confusion_matrix_youtube <- caret::confusionMatrix(
+  reference = as.factor(annotiert$echter_wert),
+  data = as.factor(annotiert$vorhergesagter_wert),
+  positive = "OFFENSE",
+  mode = "everything"
+)
+# data frame daraus machen
+confusion_matrix_youtube_tbl <- confusion_matrix_youtube$byClass %>% 
+  tibble::enframe() 
+
+confusion_matrix_youtube_wide <- confusion_matrix_youtube_tbl %>%
+  tidyr::pivot_wider() %>% 
+  janitor::clean_names()
+
+confusion_matrix_youtube_tbl %>% 
+  rmarkdown::paged_table()
+```
+
+- Sensitivity/Recall/Hit Rate/True Positive Rate: `r confusion_matrix_youtube_wide$sensitivity * 100` % der toxischen Kommentare (Label: OFFENSE) werden richtigerweise als toxisch erkennt. Bzw. wie komplett werden die toxischen Kommentare erkennt.
+  - True Positives / (True Positives + False Negatives)
+- Specificity/Selectivity/True Negative Rate: `r confusion_matrix_youtube_wide$specificity * 100` % der nicht-toxischen Kommentare (Label: OTHER) werden richtigerweise als nicht-toxisch erkennt
+  - True Negatives / (True Negatives + False Positives)
+- Precision: `r confusion_matrix_youtube_wide$precision * 100` % der als toxisch klassifizierten Kommentare sind tatsächlich toxisch. Bzw. wie valide sind die Resultate.
+  - True Positives / (True Positives + False Positives)
+
+Sowohl Precision und Recall sollten hoch sein. 
+
+- Konfidenzintervall errichten: Nach oben um 17.5% mehr und gegen unten ?
+
+Werden die Werte für Precision besser, wenn ich den Schwellenwert für eine Klassifikation anpasse?
+
+```{r}
+annotiert %>%
+  na.omit() %>% 
+  ggplot(aes(score, fill = echter_wert)) +
+  geom_histogram() +
+  facet_wrap(~paste("Vorhersage:", vorhergesagter_wert)) +
+  labs(title = "Vorhergesagte Werte vs. Echte Werte nach Scores")
+```
+
+
+Ausprobieren:
+
+```{r}
+schwellenwert_fuer_offense <- seq.default(from = 0.5, to = 0.9, length.out = 10)
+schwellenwerte_testen <- function(schwellenwert) {
+  angepasst <- annotiert %>%
+    mutate(vorhergesagter_wert = if_else(score <= schwellenwert & vorhergesagter_wert == "OFFENSE", "OFFENSE", "OTHER"))
+
+  confusion_matrix <- caret::confusionMatrix(
+    reference = as.factor(angepasst$echter_wert),
+    data = as.factor(angepasst$vorhergesagter_wert),
+    positive = "OFFENSE",
+    mode = "everything"
+  )
+  # data frame daraus machen
+  confusion_matrix_tbl <- confusion_matrix$byClass %>%
+    tibble::enframe()
+
+  confusion_matrix_wide <- confusion_matrix_tbl %>%
+    tidyr::pivot_wider() %>%
+    janitor::clean_names()
+}
+werte_bei_angepassten_schwellenwerte <- tibble::tibble(
+  schwellenwert = schwellenwert_fuer_offense
+) %>% 
+  mutate(modellguete = purrr::map(schwellenwert, schwellenwerte_testen)) %>%
+  tidyr::unnest_wider(col = modellguete)
+werte_bei_angepassten_schwellenwerte %>%
+  rmarkdown::paged_table()
+```
+
+```{r}
+library(ggplot2)
+werte_bei_angepassten_schwellenwerte %>% 
+  ggplot(aes(schwellenwert, precision)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Precision bei unterschiedliche Schwellenwerten für Klassifizierung als OFFENSE")
+```
+
+Leider geht das nicht: Der ursprüngliche Out-of-Sample Precision Test wird so nicht erreicht.
+
+### Korrekturfaktor berechnen
+
+Da der Algorithmus zu viele Kommentare fälschlicherweise als toxisch erkennt, muss diese Zahl anhand den Confusion Matrix-Kennzahlen im Out-of-Sample angepasst werden.
+
+Im manuell annotierten Datenset hat es folgende Verteilung:
+
+```{r}
+annotiert %>% 
+  count(echter_wert) %>%
+  mutate(anteil = n/sum(n))
+```
+
+Der Algorithmus erkennt folgende Werte:
+
+```{r}
+annotiert %>%
+  count(vorhergesagter_wert) %>%
+  na.omit() %>% 
+  mutate(anteil = n / sum(n))
+```
+
+So sieht die Confusion Matrix aus: 
+```{r}
+confusion_matrix_korrektur <- annotiert %>% 
+  count(echter_wert, vorhergesagter_wert) %>%
+  na.omit() %>% 
+  mutate(
+    metrik =   c("True Positives", "False Negatives", "False Positive", "True Negatives"),
+    anteil = n/sum(n) * 100
+  )
+
+confusion_matrix_korrektur_wide <- confusion_matrix_korrektur %>%
+  select(-c(anteil, echter_wert, vorhergesagter_wert)) %>% 
+  tidyr::pivot_wider(names_from = metrik, values_from = n) %>% 
+  janitor::clean_names()
+
+positives <- confusion_matrix_korrektur_wide$true_positives + confusion_matrix_korrektur_wide$false_negatives
+klassifiziert_als_offense <- confusion_matrix_korrektur_wide$true_positives + confusion_matrix_korrektur_wide$false_positive
+korrektur_faktor <- positives/klassifiziert_als_offense
+confusion_matrix_korrektur
+```
+
+```{r}
+confusion_matrix_korrektur %>% 
+  transmute(
+    list = paste0(metrik, ": ", round(anteil, 2), " % ", "bzw. ", n, "")
+  )
+```
+
+
+Wie ist die Anzahl der toxischen Kommmentare dann also zu korrigieren?
+
+- Wie viele Positives/OFFENSE-Kommentare gibt es eigentlich?
+  - True Positives + False Negatives = `r positives`
+- Wie viele Kommentare stuft der Algorithmus als OFFENSE ein?
+  - True Positives + False Positives ? `r klassifiziert_als_offense`
+- Um wie viel Prozent ist die erkannte Gesamtzahl also zu hoch?
+  - 1 - (True Positives + False Negatives)/(True Positives + False Positives) * 100 = `r (1 - korrektur_faktor) * 100` %
+
+#### Bootstrappen des Korrekturfaktors 
+
+Um eine Bandbreite von Werten für die Schätzung zu erhalten, können wir anstelle eines Korrekturfaktors eine Korrekturbandbreite berechnen.
+
+```{r}
+library(sampler)
+korekturfaktor_berechnen <- function(data) {
+
+  # Simple Random Sample aus Originaldaten
+  bootstrap_sample <- rsamp(
+    df = data,
+    n = 40
+  )
+
+  confusion_matrix <- caret::confusionMatrix(
+    reference = as.factor(bootstrap_sample$echter_wert),
+    data = as.factor(bootstrap_sample$vorhergesagter_wert),
+    positive = "OFFENSE",
+    mode = "everything"
+  )
+
+
+  conf_mat <- confusion_matrix$table %>%
+    as.data.frame() %>%
+    mutate(
+      metric = c(
+        "True Positives", "False Positives",
+        "False Negatives", "True Negatives"
+      )
+    )
+
+  conf_mat_wide <- conf_mat %>%
+    janitor::clean_names() %>%
+    select(-c(prediction, reference)) %>%
+    tidyr::pivot_wider(names_from = metric, values_from = freq) %>%
+    janitor::clean_names()
+
+  all_positives <- conf_mat_wide$true_positives + conf_mat_wide$false_negatives
+  classified_as_offense <- conf_mat_wide$true_positives + conf_mat_wide$false_positives
+  correction_factor <- classified_as_offense / all_positives
+
+  as.vector(correction_factor)
+}
+
+# korekturfaktor_berechnen(annotiert) 
+```
+
+```{r}
+korrekturfaktoren_bootstrapped <- replicate(
+  n = 2500,
+  expr = {
+    korekturfaktor_berechnen(annotiert)
+    # Durschnitt berechnen
+  }
+)
+korrekturfaktoren_bootstrapped <- tibble::enframe(korrekturfaktoren_bootstrapped)
+```
+
+```{r}
+ggplot(data = korrekturfaktoren_bootstrapped, aes(x = value)) +
+  geom_histogram(binwidth = 0.025) +
+  geom_vline(aes(xintercept = mean(korrekturfaktoren_bootstrapped$value))) +
+  scale_x_continuous(breaks = scales::breaks_pretty(10))
+```
+
+
+### Resultate
+
+In diesem Teil werden die Kommentare auf ihren Anteil "Offense" über Zeit geprüft.
+
+Alle beleidigenden Kommentare:
+
+```{r}
+kommentare_scores_und_meta %>%
+  filter(label == "OFFENSE") %>% 
+  select(
+    snippet_text_original, snippet_author_display_name,
+    kommentar_id, score, snippet_like_count,
+    snippet_author_channel_url, 
+    snippet_published_at, total_reply_count) %>%
+  DT::datatable(options = list(scrollX = TRUE))
+```
+
+Wie viele Likes oder Dislikes erhalten toxische Kommentare?
+```{r}
+kommentare_scores_und_meta %>%
+  group_by(label) %>% 
+  summarize(
+    anzahl = n(),
+    mean_like_count = mean(snippet_like_count, na.rm = TRUE)
+  )
+```
+
+
+
+Berechnen des Anteils "Offense" aller Kommentare nach Video
+
+```{r}
+anteil_offense_an_kommentaren_pro_video <- kommentare_scores_und_meta %>%
+  count(content_details_video_id, label, date) %>%
+  # Korrekturfaktor anwenden
+  mutate(n = if_else(label == "OFFENSE", n * korrektur_faktor, as.double(n))) %>%
+  mutate(prop_offense = n/sum(n, na.rm = TRUE) * 100) %>% 
+  ungroup() %>%
+  filter(label == "OFFENSE") %>% 
+  arrange(desc(prop_offense))
+
+anteil_offense_an_kommentaren_pro_video %>% 
+  rmarkdown::paged_table()
+```
+
+Summe der toxischen Kommentare (korrigiert):
+
+```{r}
+anteil_offense_an_kommentaren_pro_video %>% 
+  summarize(sum_toxic = sum(n))
+```
+
+
+```{r}
+# <- kommentare_scores_und_meta %>%
+#   count(content_details_video_id, label, date) %>%
+#   tidyr::pivot_wider(
+#     names_from = label,
+#     values_from = n,
+#     names_repair = janitor::make_clean_names
+#   ) %>%
+#   # Korrekturfaktoren anwenden
+#   mutate(
+#     offense_corrected = purrr::map(
+#       list(korrekturfaktoren_bootstrapped$value),
+#       ~offense * .x
+#     )
+#   )
+```
+
+
+Deshalb runterkorrigieren:   
+
+- Algorithmus erkennt
+
+
+```{r, fig.cap='Anzahl als beleidigend erkannter Kommentare an allen Kommentaren pro Video, Dichte'}
+anteil_offense_an_kommentaren_pro_video %>% 
+  filter(label == "OFFENSE") %>% 
+  ggplot(aes(n)) +
+  geom_density()
+```
+
+```{r, fig.cap='Anteil als beleidigend erkannter Kommentare an allen Kommentaren pro Video, Dichte'}
+anteil_offense_an_kommentaren_pro_video %>% 
+  filter(label == "OFFENSE") %>% 
+  ggplot(aes(prop_offense)) +
+  geom_density()
+```
+
+Erkannter Anteil "Offense" über Zeit, Version 1
+
+```{r, fig.cap="Kommentare, die das Modell als Offense einstuft. Anteil über Zeit"}
+anteil_offense_an_kommentaren_pro_video %>%
+  filter(label == "OFFENSE") %>%
+  ungroup() %>%
+  arrange(desc(date)) %>%
+  mutate(rolling_one_month_mean = data.table::frollmean(
+    x = prop_offense, n = 15, align = "left")
+    ) %>%
+  filter(date > lubridate::ymd("2020-01-01")) %>%
+  ggplot() +
+  geom_line(
+    alpha = 1, 
+    aes(
+      x = date, y = prop_offense,
+      color = prop_offense
+      # color = "Absoluter Anteil"
+      )
+    # key_glyph = "timeseries"
+    ) +
+  geom_point(
+        aes(
+      x = date, y = prop_offense,
+      color = prop_offense
+      # color = "Absoluter Anteil"
+      ) 
+  ) +
+  # geom_line(
+  #   aes(
+  #     x = date, y = rolling_one_month_mean, 
+  #     color = "Halbmonatsdurchschnitt"),
+  #   key_glyph = "timeseries"
+  #   ) +
+    scale_color_gradient(low = "blue", high = "red") +
+  # scale_color_manual(
+  #   values = c("black", "red"),
+  #   name = "Mass"
+  #   ) +
+  labs(
+    y = "Anteil OFFENSE", x = "", 
+    title = "Toxische Kommentare zu Weltwoche Daily Episoden",
+    subtitle = "Anteil an allen YouTube-Kommentaren",
+    caption = "Y-Achse ist Quadratwurzel-skaliert, um den Ausreisser"
+    ) +
+  scale_x_date(
+    date_labels = "%b %Y",
+    date_breaks = "3 month"
+    ) +
+  scale_y_sqrt(
+    labels = scales::label_number(
+    scale = 100, suffix = " %", accuracy = 1),
+    breaks = scales::breaks_pretty(n = 10)
+    ) +
+  theme(
+    legend.position = "bottom",
+    plot.title.position =  "plot"
+    )
+```
+
+-   leichter Aufwärtstrend
+
+Version 2:
+
+```{r, fig.cap="Kommentare, die das Modell als Offense einstuft. Anteil über Zeit V2"}
+daten_offense_anteil_grafik <- anteil_offense_an_kommentaren_pro_video %>%
+  filter(label == "OFFENSE") %>%
+  ungroup() %>%
+  arrange(desc(date)) %>%
+  mutate(rolling_one_month_mean = data.table::frollmean(
+    x = prop_offense, n = 15, align = "left")
+    ) 
+
+daten_offense_anteil_grafik_max <- daten_offense_anteil_grafik %>% 
+  slice_max(prop_offense) %>%
+  left_join(meta_alle_videos, by = c("content_details_video_id"))
+
+daten_offense_anteil_grafik %>%
+  ggplot() +
+    geom_line(
+      alpha = 0.7,
+      aes(
+        x = date, y = prop_offense,
+        color = "Absoluter Anteil"
+      )
+    ) +
+    geom_line(
+      aes(
+        x = date, y = rolling_one_month_mean,
+        color = "Halbmonatsdurchschnitt"
+      ),
+      key_glyph = "timeseries"
+  ) +
+  scale_color_manual(
+    values = c("firebrick", "#3D0FF2")
+  ) + 
+  labs(
+    y = "Anteil", x = "",
+    title = "**So viel Toxisches schrieben Kommentierende zu Köppels Sendungen.**",
+    subtitle = "<span style='color:#B22222'>**Anteil toxischer Kommentare**</span> und <span style='color:#3D0FF2'>**Halbmonatsdurchschnitt**</span>",
+    caption = paste0(
+      # "Um die Ungenauigkeit des Algorithmus zu korrigieren, wurden bei der Berechnung der Anteile wurden die Anzahl der toxischen Kommentare zu jeder Episode um den Faktor ", round(korrektur_faktor, 2), 
+      # " angepasst.", 
+      # "\n",
+      "Auswertungen und Visualisierung: Balthasar Sager")
+  ) +
+  scale_x_date(
+    date_labels = "%b\n%Y",
+    date_breaks = "2 month"
+  ) +
+  # jeder zwanzigste, fünfzehnte et cetera...
+  # c(5, 6, 7, 8, 9, 10, 15, 20)/100
+  scale_y_continuous(
+    labels = scales::label_number(
+      scale = 100, suffix = " %", accuracy = 1
+    ),
+    breaks = scales::breaks_pretty(n = 10)
+  ) +
+  theme(
+    legend.position = "none",
+    plot.caption.position = "plot"
+    # legend.position = "top"
+  ) +
+  annotate("text",
+    # Text nach links
+    x = daten_offense_anteil_grafik_max$date.x - 75,
+    y = daten_offense_anteil_grafik_max$prop_offense - 0.04,
+    label = paste0(
+      format.Date(daten_offense_anteil_grafik_max$date.x, "%d. %b %Y"),
+      "\nSpezialsendung zu COVID"
+    ),
+    size = 3.3,
+    hjust = "right",
+    color = "black"
+    # fontface = "italic"
+  ) +
+  # Pfeil
+  annotate("curve",
+    xend = daten_offense_anteil_grafik_max$date.x - 7,
+    yend = daten_offense_anteil_grafik_max$prop_offense + 0.012,
+    x = daten_offense_anteil_grafik_max$date.x - 100,
+    y = daten_offense_anteil_grafik_max$prop_offense,
+    curvature = -.2, arrow = arrow(length = unit(1, "mm")),
+    color = "grey"
+  ) +
+  theme(
+    plot.subtitle = element_markdown(),
+    plot.title = element_markdown(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(size = rel(0.25)),
+    title = element_markdown()
+  )
+```
+### Anteil toxischer Kommentare über Zeit
+
+```{r, fig.cap="Kommentare, die das Modell als Offense einstuft. Anteil über Zeit V2"}
+daten_offense_anteil_grafik <- anteil_offense_an_kommentaren_pro_video %>%
+  filter(label == "OFFENSE") %>%
+  ungroup() %>%
+  arrange(desc(date)) %>%
+  mutate(rolling_one_month_mean = data.table::frollmean(
+    x = prop_offense, n = 15, align = "left")
+    ) 
+
+daten_offense_anteil_grafik_max <- daten_offense_anteil_grafik %>% 
+  slice_max(prop_offense) %>%
+  left_join(meta_alle_videos, by = c("content_details_video_id"))
+
+verschwoerung_farbe <- "#B22222"
+grau_farbe <- "#666666"
+
+library(ggfx)
+daten_offense_anteil_grafik %>%
+  ggplot() +
+  with_blur(
+    geom_line(
+      # alpha = 0.7,
+      aes(
+        x = date, y = prop_offense,
+        color = "Absoluter Anteil"
+      ),
+      color = grau_farbe
+    ), sigma = 0.9
+  ) + 
+      geom_line(
+      aes(
+        x = date, y = prop_offense,
+        color = "Absoluter Anteil"
+      ),
+      color = grau_farbe
+    ) +
+    geom_line(
+      aes(
+        x = date, y = rolling_one_month_mean,
+        color = "Halbmonatsdurchschnitt"
+      ),
+      size = 0.7,
+      key_glyph = "timeseries"
+  ) +
+  scale_color_manual(
+    values = c(verschwoerung_farbe, grau_farbe)
+  ) + 
+  scale_x_date(
+    date_labels = "%b\n%Y",
+    date_breaks = "2 month"
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(
+      scale = 100, suffix = " %", accuracy = 1
+    ),
+    breaks = scales::breaks_pretty(n = 10)
+  ) +
+  theme(
+    legend.position = "none",
+    plot.caption.position = "plot"
+  ) +
+  annotate("text",
+    # Text nach links
+    x = daten_offense_anteil_grafik_max$date.x - 95,
+    y = daten_offense_anteil_grafik_max$prop_offense - 0.03,
+    label = paste0(
+      format.Date(daten_offense_anteil_grafik_max$date.x, "%d. %b %Y"), ", ",
+      round(daten_offense_anteil_grafik_max$prop_offense * 100), " %",
+      "\nSpezialsendung zu COVID"
+    ),
+    size = 3.3,
+    hjust = "right",
+    color = grau_farbe
+  ) +
+  # Pfeil
+  with_blur(
+  annotate("curve",
+    xend = daten_offense_anteil_grafik_max$date.x - 4,
+    yend = daten_offense_anteil_grafik_max$prop_offense + 0.012,
+    x = daten_offense_anteil_grafik_max$date.x - 100,
+    y = daten_offense_anteil_grafik_max$prop_offense,
+    curvature = -.1, arrow = arrow(length = unit(0.8, "mm")),
+    color = grau_farbe
+  )
+  ) + 
+  theme(
+    plot.caption.position = "plot",
+    plot.title.position = "plot",
+    plot.caption = element_markdown(hjust = 0, color = "gray40", size = 8.5),
+    plot.subtitle = element_markdown(),
+    plot.title = element_markdown(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(size = rel(0.25)),
+    axis.title = element_text(color = "gray40"),
+    axis.title.y = element_text(color = "gray40"),
+    title = element_markdown()
+  ) +
+  scale_fill_manual(values = c("gray40", grau_farbe), guide = "none") + 
+  labs(
+    y = "", x = "",
+    title = "**So viel Toxisches schrieben Kommentierende zu Köppels Sendungen.**",
+    subtitle = paste0("<span style='color:", grau_farbe, 
+                      "'>**Anteil der toxischen an allen Kommentaren**</span> und <span style='color:", verschwoerung_farbe,
+                      "'>**Halbmonatsdurchschnitt**.</span>"),
+    caption = paste0(
+      "_Hinweis 1_: Der Halbmonatsdurchschnitt stellt zu jedem Zeitpunkt den Durchschnitt der letzten 15 Tage dar (gleitender Mittelwert).",
+      "<br>",
+      "_Hinweis 2_: Zur Berechnung des Anteils toxischer Kommentare an den Kommentaren einer Episode wird die erkannte Anzahl<br>um den Faktor ", round(korrektur_faktor, 2),
+      " multipliziert. Siehe Validität für weitere Informationen.",
+      "<br>",
+      "_Hinweis 3_: Sprünge in der Zeitreihe ergeben sich durch Sendepausen.",
+      "<br><br>",
+      "Daten: YouTube Data API", "<br>",
+      "Auswertung und Visualisierung: Balthasar Sager"
+      )
+  )
+```
+
+```{r, fig.cap="Kommentare, die das Modell als Offense einstuft. Anteil über Zeit"}
+anteil_offense_an_kommentaren_pro_video %>%
+  filter(label == "OFFENSE") %>%
+  ungroup() %>%
+  arrange(desc(date)) %>%
+  mutate(rolling_one_month_mean = data.table::frollmean(
+    x = prop_offense, n = 15, align = "left")
+    ) %>%
+  ggplot() +
+  geom_col(
+        aes(
+      x = date, y = prop_offense,
+      fill = "Absoluter Anteil"
+      ),
+      fill = "black"
+  ) +
+  geom_line(
+    aes(
+      x = date, y = rolling_one_month_mean,
+      color = "Halbmonatsdurchschnitt"),
+    key_glyph = "timeseries"
+    ) +
+  labs(
+    y = "", x = "", 
+    title = "Das Klima wird giftiger",
+    subtitle = "Anteil der YouTube-Kommentare zur jeweiligen Weltwoche Daily Episode"
+    ) +
+  scale_x_date(
+    date_labels = "%B\n%Y",
+    date_breaks = "2 month"
+    ) +
+  scale_y_continuous(
+    labels = scales::label_number(
+    scale = 100, suffix = " %", accuracy = 1),
+    breaks = scales::breaks_pretty(n = 10)
+    ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    title = element_markdown(),
+    legend.position = "top"
+  )
+```
+
+Erkannte Anzahl "Offense"-Kommentare über Zeit, rollender Halbmonatsdurchschnitt
+
+```{r, fig.cap="Kommentare, die das Modell als Offense einstuft. Absolut, über Zeit"}
+anteil_offense_an_kommentaren_pro_video %>%
+  filter(label == "OFFENSE") %>%
+  ungroup() %>%
+  arrange(desc(date)) %>% 
+  mutate(rolling_one_month_mean = data.table::frollmean(x = n, n = 15, align = "left")) %>% 
+  filter(date > lubridate::ymd("2020-01-01")) %>%
+  ggplot(aes(date, n)) +
+  geom_line(alpha = 0.3) +
+  geom_line(
+    aes(
+    x = date, y = rolling_one_month_mean, 
+    color = "Rollender Halbmonatsdurchschnitt"), 
+    color = "red"
+    ) +
+  labs(y = "Anzahl 'Offense'-Kommentare pro Video", x = "") +
+  scale_x_date(
+    date_labels = "%b\n%Y",
+    date_breaks = "3 month"
+    )
+```
+-   Aufwärtstrend
+
+```{r}
+anteil_offense_an_kommentaren_pro_video %>%
+  filter(label == "OFFENSE") %>%
+  # mutate(year = lubridate::year(date)) %>%
+  ungroup() %>%
+  arrange(desc(date)) %>%
+  filter(date > lubridate::ymd("2020-01-01")) %>%
+  ggplot() +
+  geom_histogram(
+    aes(
+      prop_offense,
+      fill = as.factor(lubridate::year(date))
+    ), binwidth = 0.01, alpha = 0.5
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = scales::breaks_pretty(n = 10)
+  ) +
+  scale_y_continuous(
+    breaks = scales::breaks_pretty(n = 15)
+  ) +
+  labs(
+    x = "Toxischer Kommentare", y = "Sendungen",
+    title = "2021 ging es bis jetzt giftiger zu und her als 2020",
+    subtitle = "Anteil an allen YouTube-Kommentaren",
+    fill = "Jahr"
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title.position = "plot"
+  )
+  # facet_wrap(~lubridate::year(date))
+```
+
+```{r}
+anteil_offense_an_kommentaren_pro_video %>%
+  filter(label == "OFFENSE") %>% 
+  summarize(mean_prop_offense = mean(prop_offense) * 100)
+```
+
+
+
+20 Episoden mit höchstem Anteil "Offense"-Kommentaren:
+
+```{r}
+anteil_offense_an_kommentaren_pro_video %>%
+  filter(label == "OFFENSE") %>%
+  slice_max(order_by = prop_offense, n = 20) %>%
+  left_join(meta, by = c("content_details_video_id", "date")) %>%
+  mutate(link = paste0("https://www.youtube.com/watch?v=", content_details_video_id)) %>%
+  relocate(link, .before = label) %>% 
+  select(-c(
+    content_details_video_id, label, kind,etag,
+    response_kind, response_etag,
+    items_kind, items_etag,
+    channel_id
+    )) %>% 
+  relocate(description, .before = content_details_video_published_at) %>% 
+  rmarkdown::paged_table()
+```
+
+Episode mit grösster Anzahl "Offense"-Kommentaren:
+
+```{r}
+episode_hoechster_anzahl_offense_kommentare <- anteil_offense_an_kommentaren_pro_video %>%
+  filter(label == "OFFENSE") %>% 
+  filter(n == max(n, na.rm = TRUE))
+```
+
+Welche Kommentare wurden da alle als "Offense" gelabelt?
+
+```{r}
+library(kableExtra)
+kommentare_scores_und_meta %>%
+  filter(content_details_video_id %in% episode_hoechster_anzahl_offense_kommentare$content_details_video_id) %>%
+  filter(label == "OFFENSE") %>% 
+  select(
+    snippet_text_original, snippet_author_display_name, 
+    snippet_author_channel_url, snippet_like_count, 
+    snippet_published_at, total_reply_count) %>% 
+  rmarkdown::paged_table()
+```
+
+### Wer schreibt beleidigende Kommentare?
+
+```{r}
+beleidigende_kommentare_pro_user <- kommentare_scores_und_meta %>%
+  # für Beleidigungen hier noch `label` und `score` hinzufügen
+  filter(label == "OFFENSE") %>% 
+  count(snippet_author_channel_id_value, sort = TRUE) %>% 
+  mutate(percent = (n/sum(n, na.rm = TRUE) * 100))
+beleidigende_kommentare_pro_user %>% 
+  rmarkdown::paged_table()
+```
+- Achtung: hier von _jenen_, die toxische Kommentare geschrieben haben!
+
+```{r}
+quantile_zu_berechnen <- seq.default(from = 0, to = 1, by = 0.05)
+# alle Kombinationen von User IDs und möglichen Kommentarlabels herstellen:
+offense_kommentare_nach_nutzer <- kommentare_scores_und_meta %>% 
+  count(label, snippet_author_channel_id_value, sort = TRUE) %>% 
+  tidyr::complete(
+    # Gruppierung
+    snippet_author_channel_id_value,
+    # komplett zu machende Spalten
+    tidyr::nesting(label)
+    ) %>%
+  # Nullen mit NAs ersetzen
+  mutate(n = tidyr::replace_na(n, 0)) %>%
+  filter(label == "OFFENSE")
+
+offense_kommentare_nach_nutzer %>%
+  select(-label) %>% 
+  summarize(anzahl_kommentare_nach_quantil = purrr::map_dbl(quantile_zu_berechnen, quantile, x = n)) %>%
+  mutate(quantil = quantile_zu_berechnen * 100) %>%
+  arrange(desc(quantil)) %>% 
+  rmarkdown::paged_table()
+```
+
+- 95% schreiben 8 oder weniger Kommentare, 5% schrieben zwischen 8 und 264 toxische Kommentare
+- Mehr als die Hälfte der Kommentierenden schrieben nie einen toxischen Kommentar, 35% schrieben einen oder mehr
+
+Gibt es Nutzer, die für das Gros der toxischen Kommentare verantwortlich sind?
+
+```{r}
+offense_kommentare_nach_nutzer %>%
+  mutate(anteil_prozent = n/sum(n) * 100) %>% 
+  arrange(desc(n)) %>% 
+  mutate(cumsum_anteil = cumsum(anteil_prozent)) 
+```
+
+- einige haben eher hohe Werte, 
+
+Welcher Anteil der Kommentierenden hat laut Modell schon mindestens einen toxischen Kommentar verfasst?
+
+```{r}
+beleidigende_kommentare_pro_user %>%
+  count(n > 3) %>%
+  mutate(n/sum(n, na.rm = TRUE))
+```
+
+Knapp 35% der Kommentierenden haben gemäss Modell mindestens zwei toxische Kommentare verfasst; bei knapp der Hälfte der Kommentierenden erkennt der Algorithmus mindestens einen toxischen Kommentar.
+
+--> bizli willkürlich, hier mit Dezilen:
+
+
+
+```{r}
+ggplot() +
+  geom_histogram(data = kommentare_pro_user, aes(n, fill = "Kommentare")) +
+  geom_histogram(data = beleidigende_kommentare_pro_user, aes(n, fill = "Beleidigende Kommentare")) +
+  scale_x_log10() +
+  scale_y_log10() +
+  coord_flip()
+```
+
+-   viele schreiben nur einen Kommentar
+
+```{r}
+beleidigende_kommentare_pro_user %>% 
+  ggplot(aes(n)) +
+  geom_density() +
+  scale_x_log10()
+```
+
+Schreiben Kommentierende ausschliesslich Beleidigendes oder haben sind die Kommentare ausgeglichen?
+
+```{r}
+anzahl_label_pro_kommentierenden <- kommentare_scores_und_meta %>%
+  # für Beleidigungen hier noch `label` und `score` hinzufügen
+  count(snippet_author_channel_id_value, label)
+
+# alle Kombinationen von Kommentierenden und Label-Werten, auch
+# jene die nicht in den Daten verzeichnet sind
+anteil_beleidigende_kommentare_pro_kommentierender <- anzahl_label_pro_kommentierenden %>% 
+tidyr::expand(snippet_author_channel_id_value, label) %>% 
+  # Anzahl tatsächliche Kommentare hinzufügen
+  left_join(anzahl_label_pro_kommentierenden, by = c("label", "snippet_author_channel_id_value")) %>% 
+  # NAs mit 0 ersetzen
+  mutate(n = tidyr::replace_na(n, 0)) %>%
+  group_by(snippet_author_channel_id_value) %>%
+  arrange(snippet_author_channel_id_value, label) %>%  
+  mutate(prop_offense = (n/sum(n, na.rm = TRUE)) * 100) %>% 
+  ungroup() %>% 
+  filter(label == "OFFENSE")
+```
+
+```{r, fig.cap='Verteilung des Anteils beleidigender Kommentare an Gesamtzahl Kommentare, Quadratwurzeltransformierte Y-Achse'}
+anteil_beleidigende_kommentare_pro_kommentierender %>% 
+ggplot(aes(prop_offense)) +
+  geom_histogram(aes(color = prop_offense)) +
+  scale_x_continuous(labels = scales::label_percent(scale = 1, suffix = " %")) +
+  scale_y_sqrt(breaks = c(4000, 3000, 2000, 1000, 500, 100, 300, 50, 15)) +
+  labs(
+    y = "Kommentierende", x = "Anteil toxischer Kommentare"
+  )
+```
+
+```{r, fig.cap='Verteilung des Anteil Kommentare, Quantile, Quadratwurzeltransformierte Y-Achse'}
+# in 5%-Schritten
+quantile_zu_berechnen <- seq.int(from = 0.0, to = 1, by = 0.05)
+anteil_beleidigende_kommentare_pro_kommentierender_quantile <-
+  anteil_beleidigende_kommentare_pro_kommentierender %>%
+  summarize(
+    prop_offense_quantil = purrr::map_dbl(
+      quantile_zu_berechnen, quantile,
+      x = prop_offense
+    ),
+    quantil = quantile_zu_berechnen * 100
+  )
+
+prozent_personen_die_keine_toxische_kommentare_geschrieben_haben <- 
+  anteil_beleidigende_kommentare_pro_kommentierender_quantile %>%
+  filter(prop_offense_quantil == 0) %>% 
+  filter(quantil == max(quantil, na.rm = TRUE)) %>% 
+  pull(quantil)
+
+prozent_personen_die_nur_toxische_kommentare_geschrieben_haben <- 
+  anteil_beleidigende_kommentare_pro_kommentierender_quantile %>%
+  filter(prop_offense_quantil == 100) %>% 
+  filter(quantil == min(quantil, na.rm = TRUE)) %>% 
+  pull(quantil)
+
+prozent_personen_die_haelfte_oder_mehr_toxische_kommentare_geschrieben_haben <- 
+  anteil_beleidigende_kommentare_pro_kommentierender_quantile %>%
+  filter(prop_offense_quantil == 50) %>% 
+  filter(quantil == min(quantil, na.rm = TRUE)) %>% 
+  pull(quantil)
+
+
+anteil_beleidigende_kommentare_pro_kommentierender_quantile %>%  
+  ggplot(aes(quantil, prop_offense_quantil)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "", 
+    y = "So viele , der toxisch ist",
+    x = "% ") +
+  annotate(
+    "curve", 
+    xend = prozent_personen_die_keine_toxische_kommentare_geschrieben_haben,
+    yend = 0 + 5,
+    x = prozent_personen_die_keine_toxische_kommentare_geschrieben_haben - 30,
+    y = 30,
+    curvature = -0.35,
+    arrow = arrow(length = unit(0.03, "npc")),
+    angle = 65
+  ) +
+  annotate(
+    "text",
+    x = prozent_personen_die_keine_toxische_kommentare_geschrieben_haben - 50,
+    y = 35,
+    hjust = 0,
+    label = paste0(
+      prozent_personen_die_keine_toxische_kommentare_geschrieben_haben, "%",
+      " haben keine ","\n", "toxischen Kommentare", "\n", "geschrieben"
+    )
+  )
+```
+```{r}
+anteil_beleidigende_kommentare_pro_kommentierender_quantile %>%  
+  ggplot(aes(100 - quantil, prop_offense_quantil)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "", 
+    y = "Anteil verfasster Kommentare, der toxisch ist",
+    x = "Anteil Personen") +
+  annotate(
+    "curve", 
+    xend = 100 - prozent_personen_die_keine_toxische_kommentare_geschrieben_haben,
+    yend = 0 + 5,
+    x = prozent_personen_die_keine_toxische_kommentare_geschrieben_haben,
+    y = 25,
+    curvature = 0.35,
+    arrow = arrow(length = unit(0.03, "npc")),
+    angle = 65
+  ) +
+  annotate(
+    "text",
+    x = 100 - (prozent_personen_die_keine_toxische_kommentare_geschrieben_haben - 40),
+    y = 25,
+    label = paste0(
+      prozent_personen_die_keine_toxische_kommentare_geschrieben_haben, "%",
+      " der Kommentierenden haben","\n", "keine toxischen Kommentare geschrieben"
+    )
+  ) +
+    annotate(
+    "text",
+    x = 100 - (prozent_personen_die_nur_toxische_kommentare_geschrieben_haben - 50),
+    y = 90,
+    label = paste0(
+      100 - prozent_personen_die_nur_toxische_kommentare_geschrieben_haben, "%",
+      " der Kommentierenden haben","\n", "nur toxische Kommentare geschrieben"
+    )
+  ) +
+  annotate(
+    "curve", 
+    xend = 100 - prozent_personen_die_nur_toxische_kommentare_geschrieben_haben + 5,
+    yend = 100,
+    x = prozent_personen_die_nur_toxische_kommentare_geschrieben_haben - 60,
+    y = 90,
+    curvature = 0.15,
+    arrow = arrow(length = unit(0.03, "npc")),
+    angle = 45
+  ) +
+  
+  annotate(
+    "text",
+    x = 100 - (prozent_personen_die_haelfte_oder_mehr_toxische_kommentare_geschrieben_haben - 45),
+    y = 50,
+    label = paste0(
+      "Bei ",
+      100 - prozent_personen_die_haelfte_oder_mehr_toxische_kommentare_geschrieben_haben, "%",
+      " der Kommentierenden ist die Hälfte\noder mehr ihrer Kommentare toxisch"
+    )
+  ) +
+  annotate(
+    "curve", 
+    xend = 100 - prozent_personen_die_haelfte_oder_mehr_toxische_kommentare_geschrieben_haben + 5,
+    yend = 50,
+    x = prozent_personen_die_haelfte_oder_mehr_toxische_kommentare_geschrieben_haben - 60,
+    y = 50,
+    curvature = 0.15,
+    arrow = arrow(length = unit(0.03, "npc")),
+    angle = 45
+  ) +
+
+  scale_x_continuous(
+    breaks = seq(0, 100, 10),
+    # breaks = scales::breaks_pretty(n = 10),
+    # labels = scales::number_format(suffix = " %", scale = )
+    labels = seq(0, 100, 10)
+    ) 
+  # theme(
+  #   axis.title = element_text(
+  #     size = 9,
+  #     color = "grey20"
+  #     ) 
+  # )
+
+```
+
+
+
+## Topic Models der Kommentare
+
+Welche Topic Models sind geeignet?
+
+Das kann anhand Exclusivity, Semantic Coherence, Held-out Likelihood und Residuals bewertet werden ([analog zu Julia Silge's Blog Post](https://juliasilge.com/blog/evaluating-stm/)).
+
+```{r}
+library(stm)
+# Auswertung der Topic Models
+heldout <- make.heldout(kommentare_sparse)
+k_result_kommentare <- stm_models_kommentare %>%
+  mutate(
+    exclusivity = purrr::map(topic_model, exclusivity),
+    semantic_coherence = purrr::map(topic_model, semanticCoherence, kommentare_sparse),
+    eval_heldout = purrr::map(topic_model, eval.heldout, heldout$missing),
+    residual = purrr::map(topic_model, checkResiduals, kommentare_sparse),
+    bound = purrr::map_dbl(topic_model, function(x) max(x$convergence$bound)),
+    lfact = purrr::map_dbl(topic_model, function(x) lfactorial(x$settings$dim$K)),
+    lbound = bound + lfact,
+    iterations = purrr::map_dbl(topic_model, function(x) length(x$convergence$bound))
+  )
+```
+
+```{r}
+k_result_kommentare %>%
+  transmute(
+    K,
+    `Exclusivity` = purrr::map_dbl(exclusivity, mean),
+    `Lower bound` = lbound,
+    Residuals = purrr::map_dbl(residual, "dispersion"),
+    `Semantic coherence` = purrr::map_dbl(semantic_coherence, mean),
+    `Held-out likelihood` = purrr::map_dbl(eval_heldout, "expected.heldout")
+  ) %>%
+  tidyr::pivot_longer(
+    cols = `Exclusivity`:`Held-out likelihood`,
+    names_to = "Metric", values_to = "Value"
+    ) %>%
+  # filter(between(K, 10, 20)) %>% 
+  ggplot(aes(K, Value, color = Metric)) +
+  geom_point() +
+  geom_line(size = 1.5, alpha = 0.7, show.legend = FALSE) +
+  facet_wrap(~Metric, scales = "free_y") +
+  labs(
+    x = "K (Anzahl Topics)",
+    y = NULL,
+    title = "Model diagnostics by number of topics"
+    # subtitle = "These diagnostics indicate that a good number of topics would be around 60"
+  )
+```
+
+```{r}
+k_result_kommentare %>%
+  select(K, exclusivity, semantic_coherence) %>%
+  filter(K %in% c(5, 10, 20, 40, 50)) %>%
+  tidyr::unnest(cols = c(exclusivity, semantic_coherence)) %>%
+  mutate(K = as.factor(K)) %>%
+  ggplot(aes(semantic_coherence, exclusivity, color = K)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(x = "Semantic coherence",
+       y = "Exclusivity",
+       title = "Comparing exclusivity and semantic coherence",
+       subtitle = "Models with fewer topics have higher semantic coherence for more topics, but lower exclusivity") +
+  facet_wrap(~K)
+```
+
+### Wortwahrscheinlichkeiten nach K
+
+#### K = 10
+
+```{r, fig.height=15, fig.cap='Topic Model mit K = 10 mit Wortwahrscheinlichkeiten nach Topic'}
+stm_models_kommentare %>%
+  filter(K == 10) %>%
+  pull(topic_model) %>%
+  purrr::map(plot_topic_model_2, n = 10)
+```
+#### K = 15
+
+```{r, fig.height=15, fig.cap='Topic Model mit K = 15 mit Wortwahrscheinlichkeiten nach Topic'}
+stm_models_kommentare %>%
+  filter(K == 15) %>%
+  pull(topic_model) %>%
+  purrr::map(plot_topic_model_2, n = 15)
+```
+
+#### K = 20
+
+```{r, fig.height=20, fig.cap='Topic Model mit K = 20 mit Wortwahrscheinlichkeiten nach Topic'}
+stm_models_kommentare %>%
+  filter(K == 20) %>%
+  pull(topic_model) %>%
+  purrr::map(plot_topic_model_2, n = 20)
+```
+
+#### K = 30
+
+```{r, fig.height=25, fig.cap='Topic Model mit K = 30 mit Wortwahrscheinlichkeiten nach Topic'}
+stm_models_kommentare %>%
+  filter(K == 30) %>%
+  pull(topic_model) %>%
+  purrr::map(plot_topic_model_2, n = 30)
+```
+
+# Untertitel
+
+## Inhalte 
+
+```{r}
+wort_anzahl_nach_video <- untertitel_long %>% 
+  count(vid, wort)
+wort_anzahl_nach_video %>% 
+  filter(wort == "diktatur") %>% 
+  summarise(n = sum(n))
+```
+
+```{r}
+wort_anzahl_nach_video %>% 
+  filter(wort == "rahmenabkommen") %>% 
+  arrange(desc(n))
+```
+
+```{r}
+wort_anzahl_nach_video %>% 
+  filter(wort == "bibel") %>% 
+  arrange(desc(n))
+```
+
+## Topic Models der Untertitel
+
+Welche Topic Models sind geeignet?
+
+Das kann anhand Exclusivity, Semantic Coherence, Held-out Likelihood und Residuals bewertet werden ([analog zu Julia Silge's Blog Post](https://juliasilge.com/blog/evaluating-stm/)).
+
+```{r}
+library(stm)
+# Auswertung der Topic Models
+heldout <- make.heldout(untertitel_sparse)
+k_result_untertitel <- stm_models %>%
+  mutate(
+    exclusivity = purrr::map(topic_model, exclusivity),
+    semantic_coherence = purrr::map(topic_model, semanticCoherence, untertitel_sparse),
+    eval_heldout = purrr::map(topic_model, eval.heldout, heldout$missing),
+    residual = purrr::map(topic_model, checkResiduals, untertitel_sparse),
+    bound = purrr::map_dbl(topic_model, function(x) max(x$convergence$bound)),
+    lfact = purrr::map_dbl(topic_model, function(x) lfactorial(x$settings$dim$K)),
+    lbound = bound + lfact,
+    iterations = purrr::map_dbl(topic_model, function(x) length(x$convergence$bound))
+  )
+```
+
+```{r}
+k_result_untertitel %>%
+  transmute(
+    K,
+    `Exclusivity` = purrr::map_dbl(exclusivity, mean),
+    `Lower bound` = lbound,
+    Residuals = purrr::map_dbl(residual, "dispersion"),
+    `Semantic coherence` = purrr::map_dbl(semantic_coherence, mean),
+    `Held-out likelihood` = purrr::map_dbl(eval_heldout, "expected.heldout")
+  ) %>%
+  tidyr::pivot_longer(
+    cols = `Exclusivity`:`Held-out likelihood`,
+    names_to = "Metric", values_to = "Value"
+    ) %>%
+  # filter(between(K, 10, 20)) %>% 
+  ggplot(aes(K, Value, color = Metric)) +
+  geom_point() +
+  geom_line(size = 1.5, alpha = 0.7, show.legend = FALSE) +
+  facet_wrap(~Metric, scales = "free_y") +
+  labs(
+    x = "K (Anzahl Topics)",
+    y = NULL,
+    title = "Model diagnostics by number of topics"
+    # subtitle = "These diagnostics indicate that a good number of topics would be around 60"
+  )
+```
+
+```{r}
+k_result_untertitel %>%
+  select(K, exclusivity, semantic_coherence) %>%
+  filter(K %in% c(5, 10, 20, 40, 50)) %>%
+  tidyr::unnest(cols = c(exclusivity, semantic_coherence)) %>%
+  mutate(K = as.factor(K)) %>%
+  ggplot(aes(semantic_coherence, exclusivity, color = K)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(x = "Semantic coherence",
+       y = "Exclusivity",
+       title = "Comparing exclusivity and semantic coherence",
+       subtitle = "Models with fewer topics have higher semantic coherence for more topics, but lower exclusivity") +
+  facet_wrap(~K)
+```
+
+### Wortwahrscheinlichkeiten nach K
+
+#### K = 10
+
+```{r, fig.height=15, fig.cap='Topic Model mit K = 10 mit Wortwahrscheinlichkeiten nach Topic'}
+stm_models %>%
+  filter(K == 10) %>%
+  pull(topic_model) %>%
+  purrr::map(plot_topic_model_2, n = 10)
+```
+
+#### K = 15
+
+```{r, fig.height=15, fig.cap='Topic Model mit K = 15 mit Wortwahrscheinlichkeiten nach Topic'}
+stm_models %>%
+  filter(K == 15) %>%
+  pull(topic_model) %>%
+  purrr::map(plot_topic_model_2, n = 15)
+```
+
+#### K = 20
+
+```{r, fig.height=20, fig.cap='Topic Model mit K = 20 mit Wortwahrscheinlichkeiten nach Topic'}
+stm_models %>%
+  filter(K == 20) %>%
+  pull(topic_model) %>%
+  purrr::map(plot_topic_model_2, n = 20)
+```
+
+#### K = 30
+
+```{r, fig.height=25, fig.cap='Topic Model mit K = 30 mit Wortwahrscheinlichkeiten nach Topic'}
+stm_models %>%
+  filter(K == 30) %>%
+  pull(topic_model) %>%
+  purrr::map(plot_topic_model_2, n = 30)
+```
+
+
+# Korreliert das Auftreten gewisser Themen mit dem Auftreten beleidigender Kommentare?
+
+## Lineare Regressionen
+
+Lineares Modell wohl geeignet um die Anzahl beleidigender da `prop_offense` normalverteilt.
+
+Wie ist der Anteil beleidigender Kommentare zu den Videos verteilt?
+
+```{r}
+filter(anteil_offense_an_kommentaren_pro_video, label == "OFFENSE") %>% 
+  ggplot(aes(prop_offense)) +
+  geom_histogram() +
+  scale_x_continuous(
+    labels = scales::number_format(scale = 100, accuracy = 1, suffix = "%")
+    ) +
+  labs(
+    x = "Anteil beleidigender Kommentare an allen Kommentaren",
+    y = "Anzahl Videos"
+  )
+```
+
+```{r}
+filter(anteil_offense_an_kommentaren_pro_video, label == "OFFENSE") %>% 
+  ggplot(aes(n)) +
+  geom_histogram() +
+  labs(y = "Anzahl Videos", x = "Anzahl beleidigende Kommentare")
+```
+
+```{r}
+regressions <- stm_models %>%
+  mutate(regression = purrr::map2(topic_model, K, find_topic_correlations)) %>%
+  tidyr::unnest_wider(regression) %>% 
+  tidyr::unnest(c(term:terms))
+```
+
+Tabelle aller Regressionen mit P-Werten und Efekten nach K-Topics
+
+```{r}
+regressions_by_p_value <- regressions %>%
+  select(-topic_model) %>% 
+  filter(term != "(Intercept)") %>%
+  arrange(p.value) %>%
+  mutate(p_value = scales::pvalue(p.value, accuracy = 0.001)) %>%
+  filter(p.value <= 0.001) %>% 
+  select(-lm_model) %>%
+  arrange(desc(estimate)) %>%
+  relocate(terms, .before = std.error) %>%
+  relocate(terms, .before = std.error) 
+regressions_by_p_value %>% 
+  rmarkdown::paged_table()
+```
+
+Nur Topics, die auf 0.001 signifikant und mit positiven Effekt:
+
+```{r}
+regressions_by_p_value %>%
+  filter(estimate > 0) %>% 
+  rmarkdown::paged_table()
+```
+
+
+Das Topic Model mit `K = 30` weist nicht nur gute Werte bei den Metrics auf, sondern in ihm korrelieren verschiedenste Topics signifikant mit dem Auftreten von beleidigenden Kommentaren.
+
+```{r}
+stm_k_30_predictive_topics <- regressions %>%
+  select(-topic_model) %>% 
+  filter(K == 30) %>%
+  filter(term != "(Intercept)") %>%
+  arrange(p.value) %>%
+  mutate(p.value = scales::pvalue(p.value, accuracy = 0.001)) 
+
+predictive_topics <- stm_k_30_predictive_topics %>%
+  filter(p.value == "<0.001") %>%
+  pull(topic)
+
+# Funktion, um Topicnummern, die signifikant mit toxischen 
+# Kommentaren zusammenhängen herauszufiltern:
+get_predictive_topics <- function(k) {
+  regressions %>%
+    select(-topic_model) %>%
+    filter(K == k) %>%
+    filter(term != "(Intercept)") %>%
+    filter(estimate > 0) %>% 
+    arrange(p.value) %>%
+    mutate(p.value = scales::pvalue(p.value, accuracy = 0.001)) %>%
+    filter(p.value == "<0.001") %>%
+    pull(topic)
+}
+
+stm_k_30_predictive_topics %>% 
+  select(-lm_model) %>% 
+  rmarkdown::paged_table()
+```
+
+Probieren, die Topics in den Untertiteln in über Zeit zu plotten:
+
+```{r, fig.height=15}
+topics_over_time <- function(topic_model) {
+  td_gamma <- topic_model %>%
+    tidy(matrix = "gamma", document_names = rownames(untertitel_sparse))
+
+  over_time_df <- td_gamma %>%
+    left_join(
+      filter(anteil_offense_an_kommentaren_pro_video, label == "OFFENSE"),
+      by = c("document" = "content_details_video_id")
+    ) %>%
+    group_by(topic, date) %>%
+    summarise(
+      n = n(),
+      gamma = mean(gamma),
+      .groups = "drop"
+    ) %>%
+    ungroup() %>%
+    mutate(
+      # Konfidenzintervalle künstlich generieren
+      gamma * 100,
+      ci_ll = gamma - qnorm(0.975) * gamma / sqrt(n),
+      ci_ul = gamma + qnorm(0.975) * gamma / sqrt(n),
+      ci_ll = if_else(ci_ll < 0, 0, ci_ll),
+      topic = as.factor(topic)
+    )
+
+  over_time_df %>%
+    ggplot(
+      aes(
+        x = date, y = gamma,
+        # ymin = ci_ll, ymax = ci_ul,
+        group = topic
+      )
+    ) +
+    geom_line(size = 1) +
+    # geom_ribbon(alpha = .2, linetype = 0) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.position = "bottom"
+    ) +
+    # scale_y_log10(
+    #   # expand = c(0, 0),
+    #   # limits = c(0, 0.35),
+    #   # labels = scales::percent
+    #   ) +
+    labs(
+      x = "Date",
+      # y = expression(gamma),
+      y = "Wahrscheinlichkeit in %, dass Folge zu bestimmtem Thema war",
+      color = "Topic",
+      fill = "Topic",
+      title = "Wahrscheinlichkeit, dass eine Folge aus einem Thema besteht"
+    ) +
+    facet_wrap(~topic, ncol = 3)
+}
+
+# stm_models %>%
+#   mutate(plot = purrr::map(topic_model, topics_over_time)) %>%
+#   .$plot
+```
+
+Inhalte der Sendung, vereinfacht:
+
+```{r, fig.height=15, fig.width=10}
+createPattern <- function(n) {
+   sprintf("(%s[^,]+),", strrep("[^,]+,", n-1))
+ }
+
+pat <- createPattern(4)
+# gsub(pat, "\\1Y", paste(myvec, collapse=","))
+
+topics_over_time_2 <- function(
+  topic_model, topics_to_filter = NULL, 
+  ncol_arg = 3, n_terms = 10) {
+  td_gamma <- topic_model %>%
+    tidy(matrix = "gamma", document_names = rownames(untertitel_sparse))
+
+  td_beta <- tidy(topic_model, matrix = "beta") %>%
+    group_by(topic) %>%
+    slice_max(order_by = beta, n = n_terms) %>%
+    select(topic, term) %>%
+    summarise(terms = list(term)) %>%
+    mutate(terms_and_topic = purrr::map(terms, paste, collapse = ", ")) %>%
+    ungroup() %>%
+    select(-terms) %>%
+    tidyr::unnest(cols = c(terms_and_topic)) %>%
+    mutate(terms_and_topic = purrr::map_chr(terms_and_topic, ~ gsub(pat, "\\1\n", paste(.x, collapse = ","))))
+
+  over_time_df <- td_gamma %>%
+    left_join(
+      filter(anteil_offense_an_kommentaren_pro_video, label == "OFFENSE"),
+      by = c("document" = "content_details_video_id")
+    ) %>%
+    group_by(topic, date) %>%
+    summarise(
+      n = n(),
+      gamma = mean(gamma),
+      .groups = "drop"
+    ) %>%
+    ungroup() %>%
+    left_join(td_beta, by = c("topic")) %>%
+    {
+      if (!is.null(topics_to_filter)) {
+        filter(., topic %in% topics_to_filter)
+      }
+      else {
+        (.)
+      }
+    }
+
+  over_time_df %>%
+    ggplot(
+      aes(
+        x = date, y = gamma,
+        fill = as.character(topic),
+        group = topic
+      )
+    ) +
+    geom_col() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      # panel.grid.major.x = element_line(size = unit(0.3, "pt")),
+      legend.position = "none"
+    ) +
+    labs(
+      x = "",
+      y = "Themenanteil",
+      color = "Topic",
+      fill = "Topic"
+    ) +
+    scale_x_date(
+      date_breaks = "2 month",
+      date_labels = "%b\n%Y"
+    ) +
+    scale_y_continuous(
+      labels = scales::number_format(scale = 100, accuracy = 1, suffix = "%")
+    ) +
+    facet_wrap(~terms_and_topic, ncol = ncol_arg, scales = "free")
+}
+
+stm_models %>%
+  filter(K == 10) %>%
+  mutate(plot = purrr::map(
+    topic_model,
+    topics_over_time_2,
+    n_terms = 8
+  )) %>%
+  .$plot
+```
+
+Inhalte der Sendung, granularer, K = 25
+
+```{r, fig.height=15, fig.width=10}
+stm_models %>%
+  filter(K == 25) %>%
+  mutate(plot = purrr::map(
+    topic_model,
+    topics_over_time_2,
+    n_terms = 6
+  )) %>%
+  .$plot
+```
+
+<!-- Nur prädiktive Topics bei K = 25 -->
+
+<!-- ```{r eval} -->
+<!-- stm_models %>% -->
+<!--   filter(K == 25) %>% -->
+<!--   mutate(plot = purrr::map( -->
+<!--     topic_model, -->
+<!--     topics_over_time_2, -->
+<!--     n_terms = 6, -->
+<!--     topics_to_filter = get_predictive_topics(25) -->
+<!--   )) %>% -->
+<!--   .$plot -->
+<!-- ``` -->
+
+Alle Topics, aber prädiktive eingefärbt bei K = 25:
+
+```{r, fig.height=15, fig.width=8}
+library(rlang)
+# h/o to Cedric Scherrer https://www.cedricscherer.com/2019/08/05/a-ggplot2-tutorial-for-beautiful-plotting-in-r/ dessen Funktion ich hierfür ein wenig abgeändert habe 
+element_textbox_highlight <- function(..., hi.labels = NULL, hi.fill = NULL,
+                                      hi.col = NULL, hi.box.col = NULL, hi.family = NULL, hi.face = NULL) {
+  structure(
+    c(element_textbox(...),
+      list(hi.labels = hi.labels, hi.fill = hi.fill, hi.col = hi.col, hi.box.col = hi.box.col, hi.family = hi.family, hi.face = hi.face)
+    ),
+    class = c("element_textbox_highlight", "element_textbox", "element_text", "element")
+  )
+}
+
+# Funktion ersetzt das jeweilige Designelement, wenn das Label der jeweiligen Facette
+# im Vektor der zu highlightenden Facetten ist, sonst nimmt es den Standardwert 
+element_grob.element_textbox_highlight <- function(element, label = "", ...) {
+  # `%||%` setzt Default value for NULL
+  if (label %in% element$hi.labels) {
+    element$fill <- element$hi.fill %||% element$fill
+    element$colour <- element$hi.col %||% element$colour
+    element$box.colour <- element$hi.box.col %||% element$box.colour
+    element$family <- element$hi.family %||% element$family
+    element$face <- element$hi.face %||% element$face
+  }
+  NextMethod()
+}
+# Funktion zum Einfärben der signifikant assoziierten Topics
+topics_over_time_color_in <- function(topic_model, topics_to_filter = NULL, color_predictive_topics = NULL,
+                                      ncol_arg = 3, n_terms = 10) {
+  td_gamma <- topic_model %>%
+    tidy(matrix = "gamma", document_names = rownames(untertitel_sparse))
+
+  td_beta <- tidy(topic_model, matrix = "beta") %>%
+    group_by(topic) %>%
+    slice_max(order_by = beta, n = n_terms) %>%
+    select(topic, term) %>%
+    summarise(terms = list(term)) %>%
+    mutate(terms_and_topic = purrr::map(terms, paste, collapse = ", ")) %>%
+    ungroup() %>%
+    select(-terms) %>%
+    tidyr::unnest(cols = c(terms_and_topic)) 
+    # mutate(terms_and_topic = purrr::map_chr(terms_and_topic, ~ gsub(pat, "\\1\n", paste(.x, collapse = ","))))
+  
+  # herausfiltern der Begriffe, die rot eingefärbt sein sollen
+  terms_to_color <- td_beta %>%
+    filter(topic %in% color_predictive_topics) %>% 
+    pull(terms_and_topic)
+
+  over_time_df <- td_gamma %>%
+    left_join(
+      filter(anteil_offense_an_kommentaren_pro_video, label == "OFFENSE"),
+      by = c("document" = "content_details_video_id")
+    ) %>%
+    group_by(topic, date) %>%
+    summarise(
+      n = n(),
+      gamma = mean(gamma),
+      .groups = "drop"
+    ) %>%
+    ungroup() %>%
+    left_join(td_beta, by = c("topic")) %>%
+    {
+      if (!is.null(topics_to_filter)) {
+        filter(., topic %in% topics_to_filter)
+      }
+      else {
+        (.)
+      }
+    }
+
+  over_time_df %>%
+    ggplot(
+      aes(
+        x = date, y = gamma,
+        fill = as.character(topic),
+        group = topic,
+        color = topic %in% color_predictive_topics
+      )
+    ) +
+    geom_col() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.position = "none",
+      plot.caption = element_text(hjust = 0, color = "gray40", size = 8.5),
+      strip.background = element_blank(),
+      strip.text = element_textbox_highlight(
+        fill = "white", 
+        box.color = "white", 
+        color = "gray40",
+        halign = .5, 
+        r = unit(0, "pt"), 
+        width = unit(1, "npc"),
+        hi.labels = terms_to_color, 
+        hi.fill = "white", 
+        hi.box.col = "white", 
+        hi.col = "firebrick",
+        hi.face = "bold"
+      ),
+      plot.title = element_markdown(), 
+      plot.subtitle = element_markdown(),
+      axis.title.y = element_text(color = "gray40")
+    ) +
+    labs(
+      x = "",
+      y = "Themenanteil",
+      color = "Topic",
+      fill = "Topic"
+    ) +
+      scale_color_manual(values = c("gray40", "firebrick"), guide = "none") +
+    scale_x_date(
+      date_breaks = "2 month",
+      date_labels = "%b\n%Y"
+    ) +
+    scale_y_continuous(
+      labels = scales::number_format(scale = 100, accuracy = 1, suffix = "%"),
+      breaks = scales::breaks_pretty(n = 3)
+    ) +
+    facet_wrap(~terms_and_topic, ncol = ncol_arg, scales = "free_x")
+}
+
+plot_no_title <- stm_models %>%
+  filter(K == 25) %>%
+  mutate(plot = purrr::map(
+    topic_model,
+    topics_over_time_color_in,
+    n_terms = 8,
+    color_predictive_topics = get_predictive_topics(25),
+    ncol_arg = 2,
+  )) %>%
+  .$plot
+plot_no_title[[1]] + 
+  labs(
+    title = "<span style='color:black;'>**Köppels Sendungen in 25 Themen**</span>",
+    subtitle = "Ein Algorithmus hat Köppels Sendungen in 25 Themen unterteilt: Die <span style='color:#666666'>grauen</span> und <span style='color:#b22222;'>**roten Wortgruppen**</span><br>zeigen die je acht wichtigsten Worte der Themen. <span style='color:#b22222;'>**Besonders viele toxische Kommentare**</span> folgten auf<br>Sendungen in denen Köppel <span style='color:#b22222;'>**die rot eingefärbten Wortgruppen**</span > benutzte.",
+    caption = "Rot eingefärbt sind die Wortgruppen, die p < 0.001 statistisch signifikant positiv mit dem Anteil toxischer Kommentare korrelieren.\nDie Wortgruppen/Themen wurden durch ein Structural Topic Model mit K = 25 generiert.\n\nDaten: YouTube Pages durch Scrapen (Untertitel), YouTube Data API (Kommentare)\nAuswertungen und Visualisierung: Balthasar Sager"
+    )
+```
+
+### Themen nach Wichtigkeit geordnet
+
+```{r}
+get_topics_over_time <- topics_over_time_color_in <- function(topic_model, topics_to_filter = NULL, color_predictive_topics = NULL,
+                                                              ncol_arg = 3, n_terms = 10) {
+  td_gamma <- topic_model %>%
+    tidy(matrix = "gamma", document_names = rownames(untertitel_sparse))
+
+  td_beta <- tidy(topic_model, matrix = "beta") %>%
+    group_by(topic) %>%
+    slice_max(order_by = beta, n = n_terms) %>%
+    select(topic, term) %>%
+    summarise(terms = list(term)) %>%
+    mutate(terms_and_topic = purrr::map(terms, paste, collapse = ", ")) %>%
+    ungroup() %>%
+    select(-terms) %>%
+    tidyr::unnest(cols = c(terms_and_topic))
+  # mutate(terms_and_topic = purrr::map_chr(terms_and_topic, ~ gsub(pat, "\\1\n", paste(.x, collapse = ","))))
+
+  # herausfiltern der Begriffe, die rot eingefärbt sein sollen
+  terms_to_color <- td_beta %>%
+    filter(topic %in% color_predictive_topics) %>%
+    pull(terms_and_topic)
+
+  over_time_df <- td_gamma %>%
+    left_join(
+      filter(anteil_offense_an_kommentaren_pro_video, label == "OFFENSE"),
+      by = c("document" = "content_details_video_id")
+    ) %>%
+    group_by(topic, date) %>%
+    summarise(
+      n = n(),
+      gamma = mean(gamma),
+      .groups = "drop"
+    ) %>%
+    ungroup() %>%
+    left_join(td_beta, by = c("topic")) %>%
+    {
+      if (!is.null(topics_to_filter)) {
+        filter(., topic %in% topics_to_filter)
+      }
+      else {
+        (.)
+      }
+    }
+
+  over_time_df
+}
+
+topics_over_time <- stm_models %>%
+  filter(K == 25) %>%
+  transmute(data = purrr::map(
+    topic_model,
+    get_topics_over_time,
+    n_terms = 8,
+    color_predictive_topics = get_predictive_topics(25),
+    ncol_arg = 2,
+  )) %>% 
+    tidyr::unnest(cols = c(data)) %>% 
+  mutate(gamma = gamma * 100) 
+
+topics_over_time %>% 
+  group_by(terms_and_topic, topic) %>% 
+  summarize(sum_gamma = sum(gamma)) %>% 
+  arrange(desc(sum_gamma)) %>% 
+  ungroup()
+```
+
+#### Themen 
+
+Episoden, in denen die prädiktiven Topics präsent waren (Anteil > 1%):
+
+```{r}
+topics_over_time_intermediate <- topics_over_time %>% 
+  filter(topic %in% get_predictive_topics(k = 25)) %>%
+  filter(gamma > 1) %>% 
+  arrange(desc(gamma)) %>% 
+  left_join(meta, by = c("date")) %>%
+  left_join(select(anteil_offense_an_kommentaren_pro_video, -n), 
+            by = c("content_details_video_id", "date")) %>%
+  mutate(prop_offense = prop_offense * 100) %>% 
+  rename(perc_offense = prop_offense) 
+
+topics_over_time_intermediate %>% 
+  select(-contains("thumbnail")) %>% 
+  rmarkdown::paged_table()
+```
+
+#### Folgen mit Diktaturvergleich-Topic
+
+```{r}
+topics_over_time_intermediate %>% 
+  filter(topic == 24) %>%
+  relocate(perc_offense, .before = n) %>% 
+  relocate(content_details_video_id, .before = perc_offense) %>% 
+  arrange(desc(perc_offense))
+```
+- https://www.youtube.com/watch?v=zKTRYrPGboc
+  - Diktaturvergleich 
+  - Terrassenschliessungen
+
+Visualisierung davon:
+```{r}
+topics_over_time_intermediate %>% 
+  filter(topic == 24) %>%
+  relocate(perc_offense, .before = n) %>% 
+  relocate(content_details_video_id, .before = perc_offense) %>% 
+  arrange(desc(perc_offense)) %>% 
+  ggplot(aes(gamma, perc_offense)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs("Anteil von Diktaturtopic an Sendung", y = "Anteil toxischer Kommentare")
+```
+
+
+  
+
+```{r}
+untertitel_long %>%
+  filter(vid == "zKTRYrPGboc") %>% 
+  filter(wort == "diktatur") %>% 
+  mutate(link_zur_stelle = paste0(
+    "https://youtu.be/",
+    vid, "?t=",
+    stringr::str_remove_all(string = start, pattern = "(\\.)[[:digit:]]+")
+  )
+  ) %>% 
+  relocate(link_zur_stelle, .before = segment_id)
+```
+
+
+```{r}
+
+topics_over_time_3 <- function(topic_model, topics_to_filter = NULL, ncol_arg = 3) {
+  td_gamma <- topic_model %>%
+    tidy(matrix = "gamma", document_names = rownames(untertitel_sparse))
+
+  td_beta <- tidy(topic_model, matrix = "beta") %>%
+    group_by(topic) %>%
+    slice_max(order_by = beta, n = 10) %>%
+    select(topic, term) %>%
+    summarise(terms = list(term)) %>%
+    mutate(terms_and_topic = purrr::map(terms, paste, collapse = ", ")) %>%
+    ungroup() %>%
+    select(-terms) %>%
+    tidyr::unnest(cols = c(terms_and_topic))
+
+  over_time_df <- td_gamma %>%
+    left_join(
+      filter(anteil_offense_an_kommentaren_pro_video, label == "OFFENSE"),
+      by = c("document" = "content_details_video_id")
+    ) %>%
+    group_by(topic, date) %>%
+    summarise(
+      n = n(),
+      gamma = mean(gamma),
+      .groups = "drop"
+    ) %>%
+    ungroup() %>%
+    left_join(td_beta, by = c("topic")) %>%
+    {
+      if (!is.null(topics_to_filter)) {
+        filter(., topic %in% topics_to_filter)
+      }
+      else {
+        (.)
+      }
+    }
+
+  over_time_df %>%
+    ggplot(
+      aes(
+        x = date, y = gamma,
+        group = terms_and_topic
+      )
+    ) +
+    geom_col(aes(fill = "Themenwahrscheinlichkeit")) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.position = "bottom"
+    ) +
+    labs(
+      x = "",
+      fill = ""
+    ) +
+    scale_x_date(date_labels = "%B\n%Y", date_breaks = "1 month") +
+    scale_y_continuous(
+      labels = scales::percent_format()
+    ) +
+    facet_wrap(~terms_and_topic, ncol = ncol_arg, scales = "free")
+}
+
+predictive_topics <- stm_k_30_predictive_topics %>%
+  filter(p.value == "<0.001") %>%
+  pull(topic)
+
+p <- stm_models %>%
+  filter(K == 30) %>%
+  mutate(plot = purrr::map(
+    topic_model,
+    topics_over_time_3,
+    topics_to_filter = predictive_topics,
+    ncol_arg = 1
+  )) %>%
+  .$plot
+
+p[[1]] +  
+  geom_line(
+    data = daten_offense_anteil_grafik, 
+    aes(
+      x = date, 
+      y = prop_offense, 
+      group = "whatever",
+      color = "Anteil toxischer Kommentare",
+      fill = NULL),
+    color = "black"
+    )
+```
+
+
+<!-- K = 30: -->
+<!-- ```{r, fig.height=25} -->
+<!-- stm_models %>% -->
+<!--   filter(K == 30) %>%  -->
+<!--   mutate(plot = purrr::map(topic_model, topics_over_time)) %>% -->
+<!--   .$plot -->
+<!-- ``` -->
+
+### Themen der Beiträge mit den toxischsten Kommentare 
+
+```{r}
+stm_k_30 <- stm_models_kommentare %>%
+  filter(K == 15) %>%
+  pull(topic_model) %>%
+  .[[1]]
+td_beta_k_30 <- tidy(stm_k_30, matrix = "beta")
+
+# Wahrscheinlichkeiten, aus welchen Themen jede Folge besteht 
+td_gamma <- tidy(stm_k_30, matrix = "gamma",
+                 document_names = rownames(kommentare_sparse))
+
+top_terms <- td_beta_k_30 %>%
+  arrange(beta) %>%
+  group_by(topic) %>%
+  top_n(8, beta) %>%
+  arrange(-beta) %>%
+  select(topic, term) %>%
+  summarise(terms = list(term)) %>%
+  mutate(terms = purrr::map(terms, paste, collapse = ", ")) %>% 
+  tidyr::unnest()
+
+gamma_terms <- td_gamma %>%
+  group_by(topic) %>%
+  summarise(gamma = mean(gamma)) %>%
+  arrange(desc(gamma)) %>%
+  left_join(top_terms, by = "topic") %>%
+  mutate(
+    topic_no = topic,
+    topic = paste0("Topic ", topic),
+    topic = reorder(topic, gamma)
+    )
+
+gamma_terms %>%
+  top_n(15, gamma) %>%
+  ggplot(aes(topic, gamma, label = terms, fill = topic)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(hjust = 0, nudge_y = 0.0005, size = 3) +
+  coord_flip() +
+  scale_y_continuous(expand = c(0,0),
+                     limits = c(0, 0.09),
+                     labels = scales::percent_format()) +
+  theme(plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 13)) +
+  labs(x = NULL, y = expression(gamma),
+       title = "Die Top 20 Themen von Weltwoche Daily",
+       subtitle = "Mit fünf wahrscheinlichsten Wörtern nach Thema")
+
+```
+
+Themen nach Auftreten:
+```{r}
+gamma_terms %>%
+  select(topic, gamma, terms) %>%
+  kable(digits = 3, 
+        col.names = c("Topic", "Expected topic proportion", "Top 7 terms"))
+
+# Top 10 toxischste Kommentarspalten
+themen_von_top_10_toxischsten_kommentarspalten <- anteil_offense_an_kommentaren_pro_video %>%
+  slice_max(order_by = prop_offense, n = 5) %>%
+  # Topics hinzufügen
+  left_join(td_gamma, by = c("content_details_video_id" = "document")) %>%
+  group_by(content_details_video_id) %>% 
+  filter(gamma == max(gamma)) %>% 
+  ungroup() %>% 
+  # Top Terms für die Themen hinzufügen
+  left_join(select(gamma_terms, -c(topic, gamma)), by = c("topic" = "topic_no"))
+```
+
+Welche Worte sind den wahrscheinlichsten Themen  gemeinsam:
+
+```{r}
+gemeinsame_worte_themen_von_top_10_toxischsten_kommentarspalten <- themen_von_top_10_toxischsten_kommentarspalten %>%
+  transmute(term_list = purrr::map(terms, strsplit, split = ",")) %>% 
+  tidyr::unnest(cols = c(term_list)) %>% 
+  tidyr::unnest(cols = c(term_list)) %>%
+  # unsichtbare Leerzeichen entfernen
+  mutate(term_list = stringr::str_squish(term_list)) %>% 
+  count(term_list, sort = TRUE)
+gemeinsame_worte_themen_von_top_10_toxischsten_kommentarspalten
+```
+
+- Kritik am 
+  - Bundesrat
+  - Demokratie
+  - 'fragen'
+- SVP?
+
+Wie oft kommen die Worte in den entsprechenden Episoden vor?
+
+```{r}
+untertitel_zu_top_10_toxischste_kommentarspalten <- themen_von_top_10_toxischsten_kommentarspalten %>%
+  distinct(content_details_video_id) %>%
+  left_join(untertitel_long, by = c("content_details_video_id" = "vid"))
+
+gemeinsame_worte_themen_von_top_10_toxischsten_kommentarspalten %>%
+  left_join(untertitel_zu_top_10_toxischste_kommentarspalten,
+    by = c("term_list" = "wort")
+  ) %>%
+  count(term_list, content_details_video_id, sort = TRUE)
+
+gemeinsame_worte_themen_von_top_10_toxischsten_kommentarspalten %>%   
+  count(term_list, sort = TRUE)
+```
+
+Häufigste Worte in Untertiteln zu 10 toxischsten Episoden, gewichtet nach TF-IDF:
+
+```{r fig.height = 12}
+untertitel_zu_top_10_toxischsten_kommentarspalten <- themen_von_top_10_toxischsten_kommentarspalten %>%
+  distinct(content_details_video_id) %>%
+  left_join(untertitel_long, by = c("content_details_video_id" = "vid"))
+
+# 
+untertitel_zu_top_10_toxischsten_kommentarspalten_tf_idf <- untertitel_zu_top_10_toxischsten_kommentarspalten %>%
+  count(content_details_video_id, wort) %>%
+  bind_tf_idf(document = content_details_video_id, term = wort, n = n) %>%
+  arrange(-tf_idf) %>%
+  group_by(content_details_video_id) %>%
+  slice_max(order_by = tf_idf, n = 5) %>%
+  ungroup()
+
+untertitel_zu_top_10_toxischsten_kommentarspalten_tf_idf %>% 
+  mutate(wort = reorder_within(wort, n, content_details_video_id)) %>%
+    ggplot(aes(wort, n, fill = content_details_video_id)) +
+    geom_col(alpha = 0.8, show.legend = FALSE) +
+    facet_wrap(~ content_details_video_id, scales = "free", ncol = 2) +
+    scale_x_reordered() +
+    coord_flip() +
+    theme(strip.text=element_text(size=11)) +
+    labs(x = NULL, y = "tf-idf",
+         title = "Am häufigsten von Köppel verwendete Worte in den zehn Folgen, deren Kommentaren am toxischsten waren",
+         subtitle = "gewichtet nach TF-IDF")
+```
+
+Häufigste Worte in toxischen Kommentaren der 10 toxischsten Kommentarspalten, gewichtet nach TF-IDF:
+
+```{r, fig.height=12}
+kommentare_zu_top_10_toxischsten_kommentarspalten <- themen_von_top_10_toxischsten_kommentarspalten %>%
+  distinct(content_details_video_id) %>%
+  left_join(
+    select(
+      kommentare_scores_und_meta, snippet_text_display,
+      score, label, content_details_video_id
+    ),
+    untertitel_long,
+    by = c("content_details_video_id")
+  ) %>%
+  filter(label == "OFFENSE") %>%
+  distinct(content_details_video_id, snippet_text_display)
+
+kommentare_zu_top_10_toxischsten_kommentarspalten_long <- kommentare_zu_top_10_toxischsten_kommentarspalten %>%
+  unnest_tokens(wort, snippet_text_display)
+
+kommentare_zu_top_10_toxischsten_kommentarspalten_tf_idf <- kommentare_zu_top_10_toxischsten_kommentarspalten_long %>%
+  count(content_details_video_id, wort) %>%
+  bind_tf_idf(document = content_details_video_id, term = wort, n = n) %>%
+  arrange(-tf_idf) %>%
+  group_by(content_details_video_id) %>%
+  slice_max(order_by = tf_idf, n = 5) %>%
+  ungroup()
+
+kommentare_zu_top_10_toxischsten_kommentarspalten_tf_idf %>%
+  left_join(meta, by = c("content_details_video_id")) %>%   
+  mutate(wort = reorder_within(wort, n, content_details_video_id)) %>%
+  ggplot(aes(wort, n, fill = content_details_video_id)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~format.Date(date, "%d. %B %Y") , scales = "free_y", ncol = 2) +
+  scale_x_reordered() +
+  coord_flip() +
+  theme(strip.text = element_text(size = 11)) +
+  labs(
+    x = NULL, y = "tf-idf",
+    title = "Häufigste Worte in den Top 10 toxischsten Kommentarspalten",
+    subtitle = "gewichtet nach TF-IDF"
+  )
+```
+
+Worte in den Untertiteln vs. den toxischen Kommentaren
+
+https://ggplot2-book.org/facet.html
+
+```{r, fig.height=10}
+kommentare_und_untertitel_top_10_toxic <- bind_rows(
+  kommentare_zu_top_10_toxischsten_kommentarspalten_tf_idf %>%
+    mutate(art = "Kommentare"),
+  untertitel_zu_top_10_toxischsten_kommentarspalten_tf_idf %>%
+    mutate(art = "Sendung")
+) %>%
+  left_join(meta, by = c("content_details_video_id"))
+
+kommentare_und_untertitel_top_10_toxic %>%
+  mutate(wort = reorder_within(wort, n, content_details_video_id)) %>%
+  mutate(art = forcats::fct_rev(art)) %>%
+  ggplot(aes(wort, n, fill = content_details_video_id)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(
+    ncol = 2,
+    . ~ format.Date(date, "%d. %B %Y") + art, 
+    scales = "free" 
+    ) +
+  scale_x_reordered() +
+  coord_flip() +
+  theme(
+    ) +
+  labs(
+    x = NULL, y = "Nennungen",
+    title = "Sendungsinhalte und Kommentare zu den fünf Sendungen mit den toxischsten Kommentarspalten",
+    subtitle = "Wortverwendungen, gewichtet nach TF-IDF"
+  )
+```
+### Bigrams
+
+```{r}
+toxische_kommentare_ngrams <- kommentare_mit_scores %>%
+  filter(label == "OFFENSE") %>%
+  unnest_tokens(
+    input = "snippet_text_original",
+    output = "bigram",
+    token = "ngrams", 
+    n = 2
+    ) %>% 
+  count(bigram, sort = TRUE)
+
+toxische_kommentare_sep <- toxische_kommentare_ngrams %>%  
+  tidyr::separate(bigram, into = c("word1", "word2"), sep = " ")
+
+stopwoerter_man <- c(
+  "youtu.be", "https", "www.youtube.com", "vimeo.com",
+  "herr", "köppel", "NA",
+  # Namen Kommentierender
+  "maria", "giuliano", "barbara", "kahler", "rudi", "ruessel",
+  "beat", "schnider", "martin", "niederhauser", "hans", "brönnimann",
+  "bernhard", "tsuballa"
+)
+toxische_kommentare_zusammen <- toxische_kommentare_sep %>%
+  filter(
+    !is.na(word1), !is.na(word2),
+    !word1 %in% c(stopwords::data_stopwords_stopwordsiso$de, stopwoerter_man),
+    !word2 %in% c(stopwords::data_stopwords_stopwordsiso$de, stopwoerter_man)
+    ) %>%
+  tidyr::unite(bigram, c(word1, word2), sep = " ")
+
+toxische_kommentare_zusammen %>% 
+  rmarkdown::paged_table()
+```
+
+#### 20 meist vorkommende Bigrams innerhalb der toxischen Kommentare
+
+```{r}
+verschwoerung_farbe <- "#B22222"
+grau_farbe <- "#666666"
+einzufaerben <- c("bill gates", "great reset", "klaus schwab", "deep state")
+toxische_kommentare_zusammen_data <- toxische_kommentare_zusammen %>%
+  slice_max(order_by = n, n = 15) %>%
+  mutate(
+    einfaerben = bigram %in% einzufaerben,
+    bigram = if_else(
+      bigram %in% einzufaerben,
+      paste0("<span style=color:", verschwoerung_farbe, ">**", bigram, "**</span>"),
+      paste0("<span style=color:", grau_farbe, ">", bigram, "</span>")
+    ),
+    bigram = forcats::fct_reorder(bigram, n)
+  )
+# neue Werte um einzufärben mit hex code und markdown formatierung
+einfaerben_vals <- toxische_kommentare_zusammen_data %>% 
+  filter(einfaerben) %>% 
+  pull(bigram)
+
+toxische_kommentare_zusammen_data %>% 
+  ggplot(aes(bigram, n)) +
+  geom_col(aes(fill = bigram %in% einfaerben_vals)) +
+  coord_flip() +
+  labs(
+    caption = c("Hinweis: Die Begriffspaare stellen die häufigsten zusammen vorkommenden Worte nach Entfernen von bedeutungslosen Begriffen <br> (sog. _«Stopwords»_) und Klarnamen von YouTube-Kommentierenden dar.<br><br>Daten: YouTube Data API<br>Auswertung und Visualisierung: Balthasar Sager"), 
+    y = "Verwendungen",
+    subtitle = "20 häufigste Begriffspaare aus den toxischen Kommentaren zu _«Weltwoche Daily»_.",
+    title = paste0(
+      "<span style=color:",
+      verschwoerung_farbe,
+      ">**Verschwörungstheorien**</span>",
+      "<b> in Hülle und Fülle</b>."
+      ),
+    fill = NULL,
+    x = ""
+  ) +
+  scale_y_continuous(breaks = scales::breaks_pretty(n = 10)) +
+  scale_fill_manual(values = c("gray40", verschwoerung_farbe), guide = "none") +
+  theme(
+    plot.title = element_markdown(),
+    plot.subtitle = element_markdown(),
+    plot.title.position = "plot",
+    axis.text.y = element_markdown(),
+    panel.grid.major.y = element_blank(),
+    axis.title = element_text(color = "gray40"),
+    plot.caption.position = "plot",
+      plot.caption = element_markdown(hjust = 0, color = "gray40", size = 8.5),
+      axis.title.y = element_text(color = "gray40")
+  )
+```
+
+
+```{r}
+kommentare %>% 
+  filter(
+    # video_id == "riECBYhFKtw",
+    stringr::str_detect(snippet_text_display, "Bananenpflücker")
+    )
+```
+
+
+
+```{r}
+left_join(td_gamma, anteil_offense_an_kommentaren_pro_video,
+  by = c("document" = "content_details_video_id")
+) %>% 
+  # filter(topic %in% predictive_topics) %>%
+  ggplot(aes(x = gamma, y = prop_offense, color = as.factor(topic))) +
+  geom_point() +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  facet_wrap(~topic) +
+  theme(legend.position = "none") +
+  labs(
+    y = "Anteil toxischer Kommentare", 
+    x = "Wahrscheinlichkeit, dass Episode aus Topic besteht"
+    )
+
+```
+
+
+
+```{r}
+untertitel_long %>% 
+  filter(wort %in% c("diktatur")) %>% 
+  count(date, wort) %>%
+  ggplot(aes(date, n, fill = wort)) +
+  geom_col() +
+    geom_col(data = anteil_offense_an_kommentaren_pro_video,
+           aes(date, -sqrt(n), fill = "black")) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%B\n%Y") + 
+  labs(x = "Vorkommen Wort 'Diktatur'")
+
+```
+
+```{r}
+untertitel_long %>% 
+  filter(wort %in% c("diktatur", "bundesrat")) %>% 
+  count(date, wort) %>%
+  ggplot(aes(date, n, fill = wort)) +
+  geom_col() +
+  labs(
+    x = "Vorkommen Wort",
+    caption = "Ein Balken entspricht den Nennungen in einer Sendung"
+    )
+```
+
+```{r, fig.height=10}
+stm_models_kommentare %>%
+  filter(K == 15) %>%
+  mutate(plot = purrr::map(
+    topic_model,
+    topics_over_time_2,
+    n_terms = 6
+  )) %>%
+  .$plot
+```
+
+# GIF aus Sendungsvorschauen erstellen
+
+Vorschau-GIFs herunterladen
+```{r}
+# purrr::map2(
+#   meta$thumbnails_medium_url,
+#   paste0(
+#     here::here("raw", "koeppel_bilder"), "/",
+#     seq_along(meta$thumbnails_high_url), ".jpg"
+#   ),
+#   download.file
+# )
+```
+
+```{r eval=FALSE}
+library(magick)
+jpg_files <- list.files(
+  here::here("raw", "koeppel_bilder"),
+  pattern = ".*jpg$",
+  full.names = TRUE
+) %>%
+  rlist::list.sample(size = 40)
+
+image_read(jpg_files) %>%
+  image_join() %>% # joins image
+  image_animate(fps = 1) %>% # animates, can opt for number of loops
+  image_write(quality = 40, here::here("raw", "koeppel_gif_2.gif")) # write to current dir
+```
+
+
